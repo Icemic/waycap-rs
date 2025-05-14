@@ -1,0 +1,31 @@
+[package]
+name = "waycap-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Adonis Carvajal <adonis.carvajal2203@gmail.com>"]
+description = "High-level Wayland screen capture library with hardware-accelerated encoding"
+documentation = "https://docs.rs/waycap-rs"
+homepage = "https://github.com/adonca2203/waycap-rs"
+repository = "https://github.com/adonca2203/waycap-rs"
+license = "MIT"
+readme = "README.md"
+keywords = ["wayland", "screen-capture", "recording", "linux", "pipewire"]
+categories = ["multimedia", "api-bindings", "hardware-support"]
+exclude = [
+    ".github/",
+    "tests/fixtures",
+    "examples/*.mp4",
+    "*.log",
+]
+
+[dependencies]
+bytemuck = "1.23.0"
+ctrlc = "3.4.7"
+drm-fourcc = "2.2.0"
+ffmpeg-next = { version = "7.1.0", features = ["codec", "format"] }
+libc = "0.2.172"
+log = "0.4.27"
+pipewire = "0.8.0"
+portal-screencast = "0.1.0"
+ringbuf = "0.4.8"
+simple-logging = "2.0.2"
