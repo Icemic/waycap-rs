@@ -125,6 +125,7 @@ impl Capture {
         quality: QualityPreset,
         include_cursor: bool,
         include_audio: bool,
+        target_fps: u16,
     ) -> Result<Self> {
         let current_time = Instant::now();
         let pause = Arc::new(AtomicBool::new(true));
@@ -247,6 +248,7 @@ impl Capture {
             video_ring_receiver,
             Arc::clone(&stop),
             Arc::clone(&pause),
+            target_fps.into(),
         );
         join_handles.push(video_worker);
 
@@ -363,7 +365,7 @@ impl Capture {
 
     /// Perform an action with the audio encoder
     /// # Examples
-    /// 
+    ///
     /// ```
     /// let mut output = ffmpeg::format::output(&filename)?;
     /// capture.with_audio_encoder(|enc| {
@@ -405,7 +407,9 @@ fn video_processor(
     mut video_recv: HeapCons<RawVideoFrame>,
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
+    target_fps: u64,
 ) -> std::thread::JoinHandle<()> {
+    let mut last_timestamp: u64 = 0;
     std::thread::spawn(move || loop {
         if stop.load(Ordering::Acquire) {
             break;
@@ -415,8 +419,14 @@ fn video_processor(
             std::thread::sleep(Duration::from_nanos(100));
             continue;
         }
-
         while let Some(raw_frame) = video_recv.try_pop() {
+            let current_time = raw_frame.timestamp as u64;
+
+            if current_time < last_timestamp / (1_000_000 / target_fps) {
+                continue;
+            }
+
+            last_timestamp = current_time;
             encoder.lock().unwrap().process(&raw_frame).unwrap();
         }
 

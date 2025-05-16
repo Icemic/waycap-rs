@@ -12,6 +12,7 @@ pub struct CaptureBuilder {
     quality_preset: Option<QualityPreset>,
     include_cursor: bool,
     include_audio: bool,
+    target_fps: u16,
 }
 
 impl Default for CaptureBuilder {
@@ -28,6 +29,7 @@ impl CaptureBuilder {
             quality_preset: None,
             include_cursor: true,
             include_audio: true,
+            target_fps: 60,
         }
     }
 
@@ -53,6 +55,11 @@ impl CaptureBuilder {
 
     pub fn with_quality_preset(mut self, quality: QualityPreset) -> Self {
         self.quality_preset = Some(quality);
+        self
+    }
+
+    pub fn with_target_fps(mut self, fps: u16) -> Self {
+        self.target_fps = fps;
         self
     }
 
@@ -89,6 +96,7 @@ impl CaptureBuilder {
             quality,
             self.include_cursor,
             self.include_audio,
+            self.target_fps,
         )
     }
 }
