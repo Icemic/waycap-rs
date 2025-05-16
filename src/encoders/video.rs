@@ -4,7 +4,6 @@ use crate::types::{config::QualityPreset, video_frame::EncodedVideoFrame};
 use ffmpeg_next::{self as ffmpeg};
 use ringbuf::HeapCons;
 
-pub const ONE_MICROS: usize = 1_000_000;
 pub const GOP_SIZE: u32 = 30;
 
 pub trait VideoEncoder: Send {

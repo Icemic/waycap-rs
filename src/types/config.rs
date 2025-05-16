@@ -1,7 +1,7 @@
 #[derive(Debug)]
 pub enum VideoEncoder {
-    Nvenc,
-    Vaapi,
+    H264Nvenc,
+    H264Vaapi,
 }
 
 #[derive(Debug)]

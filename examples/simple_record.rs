@@ -14,12 +14,12 @@ use waycap_rs::{
 
 fn main() -> Result<(), WaycapError> {
     simple_logging::log_to_stderr(log::LevelFilter::Info);
-    println!("Simple Capture Example");
-    println!("=====================");
-    println!("This example will capture your screen for 10 seconds");
-    println!("and save it as 'simple_capture.mp4'");
-    println!();
-    println!("Press Enter to start...");
+    log::info!("Simple Capture Example");
+    log::info!("=====================");
+    log::info!("This example will capture your screen");
+    log::info!("and print the frame information to the console");
+    log::info!("");
+    log::info!("Press Enter to start...");
 
     // Wait for user input
     let mut input = String::new();
@@ -30,7 +30,7 @@ fn main() -> Result<(), WaycapError> {
         .with_audio()
         .with_quality_preset(QualityPreset::Medium)
         .with_cursor_shown()
-        .with_video_encoder(VideoEncoder::Vaapi)
+        .with_video_encoder(VideoEncoder::H264Vaapi)
         .with_audio_encoder(AudioEncoder::Opus)
         .build()?;
 
@@ -42,11 +42,10 @@ fn main() -> Result<(), WaycapError> {
     let ctrlc_clone = Arc::clone(&stop);
     ctrlc::set_handler(move || {
         println!("Stopping...");
-        capture.finalize().unwrap();
+        capture.close().unwrap();
         ctrlc_clone.store(true, std::sync::atomic::Ordering::Relaxed);
     })
     .unwrap();
-
 
     let h1stop = Arc::clone(&stop);
     let handle1 = std::thread::spawn(move || loop {

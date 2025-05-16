@@ -1,3 +1,54 @@
+//! # waycap-rs
+//!
+//! `waycap-rs` is a high-level Wayland screen capture library with hardware-accelerated encoding.
+//! It provides an easy-to-use API for capturing screen content on Wayland-based Linux systems,
+//! using PipeWire for screen capture and hardware accelerated encoding for both video and audio.
+//!
+//! ## Features
+//!
+//! - Hardware-accelerated encoding (VAAPI, with NVENC support planned)
+//! - No Copy approach to encoding video frames utilizing DMA Buffers
+//! - Audio capture support
+//! - Multiple quality presets
+//! - Cursor visibility control
+//! - Fine-grained control over capture (start, pause, resume)
+//!
+//! ## Platform Support
+//!
+//! This library currently supports Linux with Wayland display server and
+//! requires the XDG Desktop Portal and PipeWire for screen capture.
+//!
+//! ## Example
+//!
+//! ```rust
+//! use waycap_rs::{CaptureBuilder, QualityPreset, VideoEncoder, AudioEncoder};
+//!
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // Create a capture instance
+//!     let mut capture = CaptureBuilder::new()
+//!         .with_audio()
+//!         .with_quality_preset(QualityPreset::Medium)
+//!         .with_cursor_shown()
+//!         .with_video_encoder(VideoEncoder::Vaapi)
+//!         .with_audio_encoder(AudioEncoder::Opus)
+//!         .build()?;
+//!     
+//!     // Start capturing
+//!     capture.start()?;
+//!     
+//!     // Get receivers for encoded frames
+//!     let video_receiver = capture.take_video_receiver();
+//!     let audio_receiver = capture.take_audio_receiver()?;
+//!     
+//!     // Process frames as needed...
+//!     
+//!     // Stop capturing when done
+//!     capture.close()?;
+//!     
+//!     Ok(())
+//! }
+//! ```
+
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -11,7 +62,7 @@ use encoders::{
     audio::AudioEncoder, opus_encoder::OpusEncoder, vaapi_encoder::VaapiEncoder,
     video::VideoEncoder,
 };
-use portal_screencast::{ScreenCast, SourceType};
+use portal_screencast::{CursorMode, ScreenCast, SourceType};
 use ringbuf::{
     traits::{Consumer, Split},
     HeapCons, HeapRb,
@@ -28,6 +79,33 @@ mod encoders;
 pub mod pipeline;
 pub mod types;
 
+/// Main capture instance for recording screen content and audio.
+///
+/// `Capture` provides methods to control the recording process, retrieve
+/// encoded frames, and manage the capture lifecycle.
+///
+/// # Examples
+///
+/// ```
+/// use waycap_rs::{CaptureBuilder, QualityPreset, VideoEncoder};
+///
+/// // Create a capture instance
+/// let mut capture = CaptureBuilder::new()
+///     .with_quality_preset(QualityPreset::Medium)
+///     .with_video_encoder(VideoEncoder::Vaapi)
+///     .build()
+///     .expect("Failed to create capture");
+///
+/// // Start the capture
+/// capture.start().expect("Failed to start capture");
+///
+/// // Get video receiver
+/// let video_receiver = capture.take_video_receiver();
+///
+/// // Process Frames
+/// while let Some(encoded_frame) = video_receiver.try_pop() {
+///     println!("Received an encoded frame");
+/// }
 pub struct Capture {
     video_encoder: Arc<Mutex<dyn VideoEncoder + Send>>,
     audio_encoder: Option<Arc<Mutex<dyn AudioEncoder + Send>>>,
@@ -68,6 +146,11 @@ impl Capture {
 
         let mut screen_cast = ScreenCast::new()?;
         screen_cast.set_source_types(SourceType::all());
+        screen_cast.set_cursor_mode(if include_cursor {
+            CursorMode::EMBEDDED
+        } else {
+            CursorMode::HIDDEN
+        });
         let active_cast = screen_cast.start(None)?;
 
         let fd = active_cast.pipewire_fd();
@@ -94,11 +177,9 @@ impl Capture {
         // Wait to get back a negotiated resolution from pipewire
         let timeout = Duration::from_secs(5);
         let start = Instant::now();
-        let (mut width, mut height) = (0, 0);
-        loop {
+        let (width, height) = loop {
             if let Ok((recv_width, recv_height)) = reso_recv.recv() {
-                (width, height) = (recv_width, recv_height);
-                break;
+                break (recv_width, recv_height);
             }
 
             if start.elapsed() > timeout {
@@ -107,16 +188,17 @@ impl Capture {
             }
 
             std::thread::sleep(Duration::from_millis(10));
-        }
+        };
+
         join_handles.push(pw_video_capure);
 
         let video_encoder: Arc<Mutex<dyn VideoEncoder + Send>> = match video_encoder_type {
-            VideoEncoderType::Nvenc => {
+            VideoEncoderType::H264Nvenc => {
                 return Err(WaycapError::Init(
                     "Nvenc is not yet implemented.".to_string(),
                 ))
             }
-            VideoEncoderType::Vaapi => {
+            VideoEncoderType::H264Vaapi => {
                 Arc::new(Mutex::new(VaapiEncoder::new(width, height, quality)?))
             }
         };
@@ -168,6 +250,7 @@ impl Capture {
         );
         join_handles.push(video_worker);
 
+        // Wait till both threads are ready
         while !audio_ready.load(Ordering::Acquire) || !video_ready.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -185,16 +268,20 @@ impl Capture {
         })
     }
 
+    /// Enables capture streams to send their frames to their encoders
     pub fn start(&mut self) -> Result<()> {
         self.pause_flag.store(false, Ordering::Release);
         Ok(())
     }
 
+    /// Temporarily stops the recording by blocking frames from being sent to the encoders
     pub fn pause(&mut self) -> Result<()> {
         self.pause_flag.store(true, Ordering::Release);
         Ok(())
     }
 
+    /// Stop recording and drain the encoders of any last frames they have in their internal
+    /// buffers
     pub fn finish(&mut self) -> Result<()> {
         self.pause_flag.store(true, Ordering::Release);
         self.video_encoder.lock().unwrap().drain()?;
@@ -205,12 +292,30 @@ impl Capture {
         Ok(())
     }
 
-    pub fn finalize(&mut self) -> Result<()> {
+    /// Resets the encoder states so we can resume encoding from within this same session
+    pub fn reset(&mut self) -> Result<()> {
+        self.video_encoder.lock().unwrap().reset()?;
+        if let Some(ref mut enc) = self.audio_encoder {
+            enc.lock().unwrap().reset()?;
+        }
+
+        Ok(())
+    }
+
+    /// Close the connection. Once called the struct cannot be re-used and must be re-built with
+    /// the `CaptureBuilder` to record again.
+    /// If your goal is to temporarily stop recording use [`Self::pause`] or [`Self::finish`] + [`Self::reset`]
+    pub fn close(&mut self) -> Result<()> {
         self.finish()?;
         self.stop_flag.store(true, Ordering::Release);
         Ok(())
     }
 
+    /// Take ownership of the ring buffer which will supply you with encoded video frame data
+    ///
+    /// **IMPORTANT**
+    ///
+    /// This gives you ownership of the buffer so this can only be called *once*
     pub fn take_video_receiver(&mut self) -> HeapCons<EncodedVideoFrame> {
         self.video_encoder
             .lock()
@@ -219,16 +324,35 @@ impl Capture {
             .unwrap()
     }
 
+    /// Take ownership of the ring buffer which will supply you with encoded audio frame data
+    ///
+    /// **IMPORTANT**
+    ///
+    /// This gives you ownership of the buffer so this can only be called *once*
     pub fn take_audio_receiver(&mut self) -> Result<HeapCons<EncodedAudioFrame>> {
         if let Some(ref mut audio_enc) = self.audio_encoder {
             return Ok(audio_enc.lock().unwrap().take_encoded_recv().unwrap());
         } else {
-            return Err(WaycapError::Validation(
+            Err(WaycapError::Validation(
                 "Audio encoder does not exist".to_string(),
-            ));
+            ))
         }
     }
 
+    /// Perform an action with the video encoder
+    /// # Examples
+    ///
+    /// ```
+    /// let mut output = ffmpeg::format::output(&filename)?;
+    ///
+    /// capture.with_video_encoder(|enc| {
+    ///     if let Some(video_encoder) = enc {
+    ///         let mut video_stream = output.add_stream(video_encoder.codec().unwrap()).unwrap();
+    ///         video_stream.set_time_base(video_encoder.time_base());
+    ///         video_stream.set_parameters(video_encoder);
+    ///     }
+    /// });
+    /// output.write_header()?;
     pub fn with_video_encoder<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Option<ffmpeg_next::encoder::Video>) -> R,
@@ -237,6 +361,20 @@ impl Capture {
         f(guard.get_encoder())
     }
 
+    /// Perform an action with the audio encoder
+    /// # Examples
+    /// 
+    /// ```
+    /// let mut output = ffmpeg::format::output(&filename)?;
+    /// capture.with_audio_encoder(|enc| {
+    ///     if let Some(audio_encoder) = enc {
+    ///         let mut audio_stream = output.add_stream(audio_encoder.codec().unwrap()).unwrap();
+    ///         audio_stream.set_time_base(audio_encoder.time_base());
+    ///         audio_stream.set_parameters(audio_encoder);
+    ///
+    ///     }
+    /// });
+    /// output.write_header()?;
     pub fn with_audio_encoder<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Option<ffmpeg_next::encoder::Audio>) -> R,
@@ -249,8 +387,7 @@ impl Capture {
 
 impl Drop for Capture {
     fn drop(&mut self) {
-        let _ = self.finalize();
-        self.stop_flag.store(true, Ordering::Release);
+        let _ = self.close();
 
         let _ = self.pw_video_terminate_tx.send(Terminate {});
         if let Some(pw_aud) = &self.pw_audio_terminate_tx {

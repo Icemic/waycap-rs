@@ -14,6 +14,12 @@ pub struct CaptureBuilder {
     include_audio: bool,
 }
 
+impl Default for CaptureBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CaptureBuilder {
     pub fn new() -> Self {
         Self {
@@ -77,12 +83,12 @@ impl CaptureBuilder {
             }
         }
 
-        Ok(Capture::new(
+        Capture::new(
             video_encoder,
             audio_encoder,
             quality,
             self.include_cursor,
             self.include_audio,
-        )?)
+        )
     }
 }
