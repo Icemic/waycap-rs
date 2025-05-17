@@ -125,7 +125,7 @@ impl Capture {
         quality: QualityPreset,
         include_cursor: bool,
         include_audio: bool,
-        target_fps: u16,
+        target_fps: u64,
     ) -> Result<Self> {
         let current_time = Instant::now();
         let pause = Arc::new(AtomicBool::new(true));
@@ -248,7 +248,7 @@ impl Capture {
             video_ring_receiver,
             Arc::clone(&stop),
             Arc::clone(&pause),
-            target_fps.into(),
+            target_fps,
         );
         join_handles.push(video_worker);
 
@@ -409,28 +409,30 @@ fn video_processor(
     pause: Arc<AtomicBool>,
     target_fps: u64,
 ) -> std::thread::JoinHandle<()> {
-    let mut last_timestamp: u64 = 0;
-    std::thread::spawn(move || loop {
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-
-        if pause.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_nanos(100));
-            continue;
-        }
-        while let Some(raw_frame) = video_recv.try_pop() {
-            let current_time = raw_frame.timestamp as u64;
-
-            if current_time < last_timestamp / (1_000_000 / target_fps) {
-                continue;
+    std::thread::spawn(move || {
+        let mut last_timestamp: u64 = 0;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                break;
             }
 
-            last_timestamp = current_time;
-            encoder.lock().unwrap().process(&raw_frame).unwrap();
-        }
+            if pause.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_nanos(100));
+                continue;
+            }
+            while let Some(raw_frame) = video_recv.try_pop() {
+                let current_time = raw_frame.timestamp as u64;
 
-        std::thread::sleep(Duration::from_nanos(100));
+                if current_time < last_timestamp + (1_000_000 / target_fps) {
+                    continue;
+                }
+
+                last_timestamp = current_time;
+                encoder.lock().unwrap().process(&raw_frame).unwrap();
+            }
+
+            std::thread::sleep(Duration::from_nanos(100));
+        }
     })
 }
 
