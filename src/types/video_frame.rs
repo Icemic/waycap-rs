@@ -12,6 +12,7 @@ pub struct EncodedVideoFrame {
 
 #[derive(Debug)]
 pub struct RawVideoFrame {
+    pub data: Vec<u8>,
     pub timestamp: i64,
     pub dmabuf_fd: Option<RawFd>,
     pub stride: i32,

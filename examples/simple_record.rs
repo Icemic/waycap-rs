@@ -30,7 +30,7 @@ fn main() -> Result<(), WaycapError> {
         .with_audio()
         .with_quality_preset(QualityPreset::Medium)
         .with_cursor_shown()
-        .with_video_encoder(VideoEncoder::H264Vaapi)
+        .with_video_encoder(VideoEncoder::H264Nvenc)
         .with_audio_encoder(AudioEncoder::Opus)
         .build()?;
 

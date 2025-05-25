@@ -26,6 +26,7 @@ use super::Terminate;
 pub struct VideoCapture {
     video_ready: Arc<AtomicBool>,
     audio_ready: Arc<AtomicBool>,
+    use_ram_copy: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -34,10 +35,15 @@ struct UserData {
 }
 
 impl VideoCapture {
-    pub fn new(video_ready: Arc<AtomicBool>, audio_ready: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        video_ready: Arc<AtomicBool>,
+        audio_ready: Arc<AtomicBool>,
+        use_ram_copy: bool,
+    ) -> Self {
         Self {
             video_ready,
             audio_ready,
+            use_ram_copy,
         }
     }
 
@@ -88,7 +94,7 @@ impl VideoCapture {
         let _video_stream = video_stream
             .add_local_listener_with_user_data(data)
             .state_changed(move |_, _, old, new| {
-                log::debug!("Video Stream State Changed: {0:?} -> {1:?}", old, new);
+                log::info!("Video Stream State Changed: {0:?} -> {1:?}", old, new);
                 ready_clone.store(
                     new == StreamState::Streaming,
                     std::sync::atomic::Ordering::Release,
@@ -98,6 +104,7 @@ impl VideoCapture {
                 let Some(param) = param else {
                     return;
                 };
+
                 if id != pw::spa::param::ParamType::Format.as_raw() {
                     return;
                 }
@@ -169,6 +176,7 @@ impl VideoCapture {
                         if fd.is_some()
                             && ringbuf_producer
                                 .try_push(RawVideoFrame {
+                                    data: Vec::new(),
                                     timestamp: time_us,
                                     dmabuf_fd: fd,
                                     stride: data.chunk().stride(),
@@ -181,13 +189,29 @@ impl VideoCapture {
                                 "Error sending video frame at: {:?}. Ring buf full?",
                                 time_us
                             );
+                        } else if ringbuf_producer
+                            .try_push(RawVideoFrame {
+                                data: data.data().unwrap().to_vec(),
+                                timestamp: time_us,
+                                dmabuf_fd: None,
+                                stride: 0,
+                                offset: 0,
+                                size: 0,
+                            })
+                            .is_err()
+                        {
+                            log::error!(
+                                "Error sending video frame at: {:?}. Ring buf full?",
+                                time_us
+                            );
                         }
                     }
                 }
             })
             .register()?;
 
-        let video_spa_obj = pw::spa::pod::object!(
+        // TODO: Use features?
+        let ram_copy_spa_obj = pw::spa::pod::object!(
             pw::spa::utils::SpaTypes::ObjectParamFormat,
             pw::spa::param::ParamType::EnumFormat,
             pw::spa::pod::property!(
@@ -208,11 +232,6 @@ impl VideoCapture {
                 pw::spa::param::video::VideoFormat::NV12,
                 pw::spa::param::video::VideoFormat::I420,
                 pw::spa::param::video::VideoFormat::BGRA,
-            ),
-            pw::spa::pod::property!(
-                pw::spa::param::format::FormatProperties::VideoModifier,
-                Long,
-                0
             ),
             pw::spa::pod::property!(
                 pw::spa::param::format::FormatProperties::VideoSize,
@@ -243,24 +262,98 @@ impl VideoCapture {
             ),
         );
 
-        let video_spa_values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
-            std::io::Cursor::new(Vec::new()),
-            &pw::spa::pod::Value::Object(video_spa_obj),
-        )
-        .unwrap()
-        .0
-        .into_inner();
+        let dma_buf_spa_obj = pw::spa::pod::object!(
+            pw::spa::utils::SpaTypes::ObjectParamFormat,
+            pw::spa::param::ParamType::EnumFormat,
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::MediaType,
+                Id,
+                pw::spa::param::format::MediaType::Video
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::MediaSubtype,
+                Id,
+                pw::spa::param::format::MediaSubtype::Raw
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoModifier,
+                Long,
+                0
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoFormat,
+                Choice,
+                Enum,
+                Id,
+                pw::spa::param::video::VideoFormat::NV12,
+                pw::spa::param::video::VideoFormat::I420,
+                pw::spa::param::video::VideoFormat::BGRA,
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoSize,
+                Choice,
+                Range,
+                Rectangle,
+                pw::spa::utils::Rectangle {
+                    width: 2560,
+                    height: 1440
+                }, // Default
+                pw::spa::utils::Rectangle {
+                    width: 1,
+                    height: 1
+                }, // Min
+                pw::spa::utils::Rectangle {
+                    width: 4096,
+                    height: 4096
+                } // Max
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoFramerate,
+                Choice,
+                Range,
+                Fraction,
+                pw::spa::utils::Fraction { num: 240, denom: 1 }, // Default
+                pw::spa::utils::Fraction { num: 0, denom: 1 },   // Min
+                pw::spa::utils::Fraction { num: 244, denom: 1 }  // Max
+            ),
+        );
 
-        let mut video_params = [Pod::from_bytes(&video_spa_values).unwrap()];
+        // TODO: Figure out how to make dma buf work with nvidia gpus
+        if self.use_ram_copy {
+            let video_spa_values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+                std::io::Cursor::new(Vec::new()),
+                &pw::spa::pod::Value::Object(ram_copy_spa_obj),
+            )
+            .unwrap()
+            .0
+            .into_inner();
+            let mut video_params = [Pod::from_bytes(&video_spa_values).unwrap()];
+            video_stream.connect(
+                Direction::Input,
+                Some(stream_node),
+                StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+                &mut video_params,
+            )?;
 
-        video_stream.connect(
-            Direction::Input,
-            Some(stream_node),
-            StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
-            &mut video_params,
-        )?;
+            log::debug!("Video Stream: {0:?}", video_stream);
+        } else {
+            let video_spa_values: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+                std::io::Cursor::new(Vec::new()),
+                &pw::spa::pod::Value::Object(dma_buf_spa_obj),
+            )
+            .unwrap()
+            .0
+            .into_inner();
+            let mut video_params = [Pod::from_bytes(&video_spa_values).unwrap()];
+            video_stream.connect(
+                Direction::Input,
+                Some(stream_node),
+                StreamFlags::AUTOCONNECT | StreamFlags::MAP_BUFFERS,
+                &mut video_params,
+            )?;
 
-        log::debug!("Video Stream: {0:?}", video_stream);
+            log::debug!("Video Stream: {0:?}", video_stream);
+        }
 
         pw_loop.run();
         Ok(())

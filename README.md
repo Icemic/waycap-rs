@@ -4,9 +4,9 @@ A high-level Wayland screen capture library with hardware-accelerated encoding f
 
 ## Features
 
-- **Hardware-accelerated video encoding** (VAAPI supported, with NVENC planned)
+- **Hardware-accelerated video encoding** (Using VAAPI or NVenc)
 - **Audio capture** with Opus encoding
-- **Copy-Free** video encoding leveraging pipewire's DMA Buffers
+- **Copy-Free** video encoding leveraging pipewire's DMA Buffers (For Vaapi only right now)
 - **Multiple quality presets** for various use cases
 - **Cursor visibility control**
 - **Simple, ergonomic API** for easy integration

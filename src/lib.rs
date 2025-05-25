@@ -59,8 +59,8 @@ use std::{
 
 use capture::{audio::AudioCapture, video::VideoCapture, Terminate};
 use encoders::{
-    audio::AudioEncoder, opus_encoder::OpusEncoder, vaapi_encoder::VaapiEncoder,
-    video::VideoEncoder,
+    audio::AudioEncoder, nvenc_encoder::NvencEncoder, opus_encoder::OpusEncoder,
+    vaapi_encoder::VaapiEncoder, video::VideoEncoder,
 };
 use portal_screencast::{CursorMode, ScreenCast, SourceType};
 use ringbuf::{
@@ -158,8 +158,17 @@ impl Capture {
         let stream = active_cast.streams().next().unwrap();
         let stream_node = stream.pipewire_node();
 
+        let use_ram_copy = match video_encoder_type {
+            VideoEncoderType::H264Nvenc => true,
+            VideoEncoderType::H264Vaapi => false,
+        };
+
         let pw_video_capure = std::thread::spawn(move || {
-            let video_cap = VideoCapture::new(video_ready_pw, audio_ready_pw);
+            let video_cap = VideoCapture::new(
+                video_ready_pw,
+                audio_ready_pw,
+                use_ram_copy,
+            );
             video_cap
                 .run(
                     fd,
@@ -195,9 +204,7 @@ impl Capture {
 
         let video_encoder: Arc<Mutex<dyn VideoEncoder + Send>> = match video_encoder_type {
             VideoEncoderType::H264Nvenc => {
-                return Err(WaycapError::Init(
-                    "Nvenc is not yet implemented.".to_string(),
-                ))
+                Arc::new(Mutex::new(NvencEncoder::new(width, height, quality)?))
             }
             VideoEncoderType::H264Vaapi => {
                 Arc::new(Mutex::new(VaapiEncoder::new(width, height, quality)?))
