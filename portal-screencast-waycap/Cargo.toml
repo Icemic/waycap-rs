@@ -2,7 +2,7 @@
 name = "portal-screencast-waycap"
 version = "0.1.1"
 description = "Rustic interface to the ScreenCast Desktop Portal"
-documentation = "https://docs.rs/portal-screencast-waycap"
+documentation = "https://docs.rs/portal_screencast_waycap"
 repository = "https://github.com/Adonca2203/waycap-rs"
 license = "MIT"
 keywords = ["ffi","screen","capture","dbus","linux"]
