@@ -1,6 +1,6 @@
 [package]
 name = "portal-screencast-waycap"
-version = "0.1.1"
+version = "1.0.0"
 description = "Rustic interface to the ScreenCast Desktop Portal"
 documentation = "https://docs.rs/portal_screencast_waycap"
 repository = "https://github.com/Adonca2203/waycap-rs"
