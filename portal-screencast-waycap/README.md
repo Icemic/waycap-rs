@@ -5,6 +5,9 @@ through calls to D-Bus 'portal' APIs. One such portal is the [`ScreenCast`][sc]
 portal. This portal allows a user to choose which windows or screens to share
 and provides access to raw video data through PipeWire.
 
+This is a fork of the one found in https://github.com/iwillspeak/obs-screencap which adds the ability
+to set cursor visibility and additonal stream metadata.
+
 ## Simple Use
 
 In the simples case this crate can be used to open a new screen cast with the

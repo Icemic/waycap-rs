@@ -1,12 +1,12 @@
 [package]
-name = "portal-screencast"
+name = "portal-screencast-waycap"
 version = "0.1.1"
 description = "Rustic interface to the ScreenCast Desktop Portal"
-documentation = "https://docs.rs/portal-screencast"
-repository = "https://github.com/iwillspeak/obs-screencap"
+documentation = "https://docs.rs/portal-screencast-waycap"
+repository = "https://github.com/Adonca2203/waycap-rs"
 license = "MIT"
 keywords = ["ffi","screen","capture","dbus","linux"]
-authors = ["Will Speak <lithiumflame@gmail.com>"]
+authors = ["Adonis Carvajal <adonis.carvajal2203@gmail.com>"]
 edition = "2018"
 readme = "README.md"
 
