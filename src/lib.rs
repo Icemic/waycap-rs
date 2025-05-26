@@ -6,7 +6,7 @@
 //!
 //! ## Features
 //!
-//! - Hardware-accelerated encoding (VAAPI, with NVENC support planned)
+//! - Hardware-accelerated encoding (VAAPI and NVENC)
 //! - No Copy approach to encoding video frames utilizing DMA Buffers
 //! - Audio capture support
 //! - Multiple quality presets
