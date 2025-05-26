@@ -26,6 +26,6 @@ ffmpeg-next = { version = "7.1.0", features = ["codec", "format"] }
 libc = "0.2.172"
 log = "0.4.27"
 pipewire = "0.8.0"
-portal-screencast = { path = "./portal-screencast"}
+portal-screencast-waycap = "1.0.0"
 ringbuf = "0.4.8"
 simple-logging = "2.0.2"

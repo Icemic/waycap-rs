@@ -62,7 +62,7 @@ use encoders::{
     audio::AudioEncoder, nvenc_encoder::NvencEncoder, opus_encoder::OpusEncoder,
     vaapi_encoder::VaapiEncoder, video::VideoEncoder,
 };
-use portal_screencast::{CursorMode, ScreenCast, SourceType};
+use portal_screencast_waycap::{CursorMode, ScreenCast, SourceType};
 use ringbuf::{
     traits::{Consumer, Split},
     HeapCons, HeapRb,

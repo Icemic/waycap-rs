@@ -74,8 +74,8 @@ impl From<pipewire::Error> for WaycapError {
     }
 }
 
-impl From<portal_screencast::PortalError> for WaycapError {
-    fn from(err: portal_screencast::PortalError) -> Self {
+impl From<portal_screencast_waycap::PortalError> for WaycapError {
+    fn from(err: portal_screencast_waycap::PortalError) -> Self {
         WaycapError::Portal(err.to_string())
     }
 }
