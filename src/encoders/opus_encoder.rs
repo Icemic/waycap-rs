@@ -168,6 +168,7 @@ impl AudioEncoder for OpusEncoder {
 
     fn reset(&mut self) -> crate::types::error::Result<()> {
         self.drop_encoder();
+        self.capture_timestamps.clear();
         self.encoder = Some(Self::create_encoder()?);
 
         Ok(())
