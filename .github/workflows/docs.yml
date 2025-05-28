@@ -59,7 +59,7 @@ jobs:
     - name: Build documentation
       run: |
         cargo doc --no-deps --document-private-items --all-features
-        echo '<meta http-equiv="refresh" content="0; url=./doc/waycap_rs/">' > target/doc/index.html
+        echo '<meta http-equiv="refresh" content="0; url=./waycap_rs/">' > target/doc/index.html
 
     - name: Setup Pages
       uses: actions/configure-pages@v4
