@@ -164,11 +164,7 @@ impl Capture {
         };
 
         let pw_video_capure = std::thread::spawn(move || {
-            let video_cap = VideoCapture::new(
-                video_ready_pw,
-                audio_ready_pw,
-                use_ram_copy,
-            );
+            let video_cap = VideoCapture::new(video_ready_pw, audio_ready_pw, use_ram_copy);
             video_cap
                 .run(
                     fd,
@@ -317,6 +313,18 @@ impl Capture {
     pub fn close(&mut self) -> Result<()> {
         self.finish()?;
         self.stop_flag.store(true, Ordering::Release);
+        let _ = self.pw_video_terminate_tx.send(Terminate {});
+        if let Some(pw_aud) = &self.pw_audio_terminate_tx {
+            let _ = pw_aud.send(Terminate {});
+        }
+
+        for handle in self.worker_handles.drain(..) {
+            let _ = handle.join();
+        }
+
+        self.video_encoder.lock().unwrap().drop_encoder();
+        self.audio_encoder.take();
+
         Ok(())
     }
 
@@ -397,15 +405,6 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         let _ = self.close();
-
-        let _ = self.pw_video_terminate_tx.send(Terminate {});
-        if let Some(pw_aud) = &self.pw_audio_terminate_tx {
-            let _ = pw_aud.send(Terminate {});
-        }
-
-        for handle in self.worker_handles.drain(..) {
-            let _ = handle.join();
-        }
     }
 }
 

@@ -150,8 +150,8 @@ impl AudioCapture {
                             timestamp: time_us,
                         }) {
                             log::error!(
-                                "Could not add audio frame: {:?}. Is the buffer full?",
-                                frame
+                                "Could not add audio frame at: {:?}. Is the buffer full?",
+                                frame.timestamp
                             );
                         }
                     }

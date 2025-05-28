@@ -27,8 +27,8 @@ impl CaptureBuilder {
             video_encoder: None,
             audio_encoder: None,
             quality_preset: None,
-            include_cursor: true,
-            include_audio: true,
+            include_cursor: false,
+            include_audio: false,
             target_fps: 60,
         }
     }
