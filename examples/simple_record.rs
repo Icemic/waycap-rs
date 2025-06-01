@@ -27,17 +27,15 @@ fn main() -> Result<(), WaycapError> {
     let stop = Arc::new(AtomicBool::new(false));
 
     let mut capture = CaptureBuilder::new()
-        .with_audio()
         .with_quality_preset(QualityPreset::Medium)
         .with_cursor_shown()
         .with_video_encoder(VideoEncoder::H264Nvenc)
-        .with_audio_encoder(AudioEncoder::Opus)
         .build()?;
 
     capture.start()?;
 
     let mut video_recv = capture.take_video_receiver();
-    let mut audio_recv = capture.take_audio_receiver().unwrap();
+    // let mut audio_recv = capture.take_audio_receiver().unwrap();
 
     let ctrlc_clone = Arc::clone(&stop);
     ctrlc::set_handler(move || {
@@ -63,28 +61,28 @@ fn main() -> Result<(), WaycapError> {
         std::thread::sleep(Duration::from_nanos(100));
     });
 
-    let h2stop = Arc::clone(&stop);
-    let handle2 = std::thread::spawn(move || loop {
-        if h2stop.load(std::sync::atomic::Ordering::Acquire) {
-            break;
-        }
-
-        while let Some(encoded_frame) = audio_recv.try_pop() {
-            log::info!("======= NEW AUDIO FRAME =======");
-            log::info!("PTS: {:?}", encoded_frame.pts);
-            log::info!("Capture Time Stamp: {:?}", encoded_frame.timestamp);
-            log::info!("===============================");
-        }
-
-        std::thread::sleep(Duration::from_nanos(100));
-    });
+    // let h2stop = Arc::clone(&stop);
+    // let handle2 = std::thread::spawn(move || loop {
+    //     if h2stop.load(std::sync::atomic::Ordering::Acquire) {
+    //         break;
+    //     }
+    //
+    //     while let Some(encoded_frame) = audio_recv.try_pop() {
+    //         log::info!("======= NEW AUDIO FRAME =======");
+    //         log::info!("PTS: {:?}", encoded_frame.pts);
+    //         log::info!("Capture Time Stamp: {:?}", encoded_frame.timestamp);
+    //         log::info!("===============================");
+    //     }
+    //
+    //     std::thread::sleep(Duration::from_nanos(100));
+    // });
 
     while !stop.load(std::sync::atomic::Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(100));
     }
 
     let _ = handle1.join();
-    let _ = handle2.join();
+    // let _ = handle2.join();
 
     Ok(())
 }

@@ -1,4 +1,11 @@
-use ffmpeg_next::{self as ffmpeg, Rational};
+use ffmpeg_next::{
+    self as ffmpeg,
+    ffi::{
+        av_buffer_ref, av_buffer_unref, av_hwframe_ctx_init, AVHWDeviceContext, AVHWFramesContext,
+        AVPixelFormat,
+    },
+    Rational,
+};
 use ringbuf::{
     traits::{Producer, Split},
     HeapCons, HeapProd, HeapRb,
@@ -6,11 +13,11 @@ use ringbuf::{
 
 use crate::types::{
     config::QualityPreset,
-    error::Result,
+    error::{Result, WaycapError},
     video_frame::{EncodedVideoFrame, RawVideoFrame},
 };
 
-use super::video::{VideoEncoder, GOP_SIZE};
+use super::video::{create_hw_device, create_hw_frame_ctx, VideoEncoder, GOP_SIZE};
 
 pub struct NvencEncoder {
     encoder: Option<ffmpeg::codec::encoder::Video>,
@@ -45,16 +52,22 @@ impl VideoEncoder for NvencEncoder {
 
     fn process(&mut self, frame: &RawVideoFrame) -> Result<()> {
         if let Some(ref mut encoder) = self.encoder {
-            let mut src_frame = ffmpeg::util::frame::video::Video::new(
-                ffmpeg_next::format::Pixel::BGRA,
-                encoder.width(),
-                encoder.height(),
-            );
+            if let Some(fd) = frame.dmabuf_fd {
+                log::info!("Got dma buf {:?}", frame);
+                // TODO: Figure out how to turn the DMA Buf into an AVFrame I
+                // can pass to the encoder (DRM PRIME/similar approach to vaapi?)
+            } else {
+                let mut src_frame = ffmpeg::util::frame::video::Video::new(
+                    ffmpeg_next::format::Pixel::BGRA,
+                    encoder.width(),
+                    encoder.height(),
+                );
 
-            src_frame.set_pts(Some(frame.timestamp));
-            src_frame.data_mut(0).copy_from_slice(&frame.data);
+                src_frame.set_pts(Some(frame.timestamp));
+                src_frame.data_mut(0).copy_from_slice(&frame.data);
 
-            encoder.send_frame(&src_frame).unwrap();
+                encoder.send_frame(&src_frame).unwrap();
+            }
 
             // Retrieve and handle the encoded packet
             let mut packet = ffmpeg::codec::packet::Packet::empty();
@@ -144,14 +157,42 @@ impl NvencEncoder {
 
         encoder_ctx.set_width(width);
         encoder_ctx.set_height(height);
-        encoder_ctx.set_format(ffmpeg::format::Pixel::BGRA);
+        encoder_ctx.set_format(ffmpeg::format::Pixel::CUDA);
         encoder_ctx.set_bit_rate(16_000_000);
 
-        // These should be part of a config file
-        encoder_ctx.set_time_base(Rational::new(1, 1_000_000));
+        let mut nvenc_device =
+            create_hw_device(ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA)?;
+        let mut frame_ctx = create_hw_frame_ctx(nvenc_device)?;
 
-        // Needed to insert I-Frames more frequently so we don't lose full seconds
-        // when popping frames from the front
+        unsafe {
+            let hw_frame_context = &mut *((*frame_ctx).data as *mut AVHWFramesContext);
+            hw_frame_context.width = width as i32;
+            hw_frame_context.height = height as i32;
+            hw_frame_context.sw_format = AVPixelFormat::AV_PIX_FMT_NV12;
+            hw_frame_context.format = encoder_ctx.format().into();
+            hw_frame_context.device_ref = av_buffer_ref(nvenc_device);
+            hw_frame_context.device_ctx = (*nvenc_device).data as *mut AVHWDeviceContext;
+            // Decides buffer size if we do not pop frame from the encoder we cannot
+            // enqueue more than these many -- maybe adjust but for now setting it to
+            // doble target fps
+            hw_frame_context.initial_pool_size = 120;
+
+            let err = av_hwframe_ctx_init(frame_ctx);
+            if err < 0 {
+                return Err(WaycapError::Init(format!(
+                    "Error trying to initialize hw frame context: {:?}",
+                    err
+                )));
+            }
+
+            (*encoder_ctx.as_mut_ptr()).hw_device_ctx = av_buffer_ref(nvenc_device);
+            (*encoder_ctx.as_mut_ptr()).hw_frames_ctx = av_buffer_ref(frame_ctx);
+
+            av_buffer_unref(&mut nvenc_device);
+            av_buffer_unref(&mut frame_ctx);
+        }
+
+        encoder_ctx.set_time_base(Rational::new(1, 1_000_000));
         encoder_ctx.set_gop(GOP_SIZE);
 
         let encoder_params = ffmpeg::codec::Parameters::new();

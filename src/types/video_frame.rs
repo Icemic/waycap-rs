@@ -18,4 +18,5 @@ pub struct RawVideoFrame {
     pub stride: i32,
     pub offset: u32,
     pub size: u32,
+    pub modifier: u64,
 }

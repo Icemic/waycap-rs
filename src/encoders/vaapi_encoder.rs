@@ -1,12 +1,12 @@
-use std::{ffi::CString, ptr::null_mut};
+use std::ptr::null_mut;
 
 use drm_fourcc::DrmFourcc;
 use ffmpeg_next::{
     self as ffmpeg,
     ffi::{
         av_buffer_create, av_buffer_default_free, av_buffer_ref, av_buffer_unref,
-        av_hwdevice_ctx_create, av_hwframe_ctx_alloc, av_hwframe_ctx_init, AVBufferRef,
-        AVDRMFrameDescriptor, AVHWDeviceContext, AVHWFramesContext, AVPixelFormat,
+        av_hwframe_ctx_init, AVDRMFrameDescriptor, AVHWDeviceContext, AVHWFramesContext,
+        AVPixelFormat,
     },
     Rational,
 };
@@ -21,7 +21,7 @@ use crate::types::{
     video_frame::{EncodedVideoFrame, RawVideoFrame},
 };
 
-use super::video::{VideoEncoder, GOP_SIZE};
+use super::video::{create_hw_device, create_hw_frame_ctx, VideoEncoder, GOP_SIZE};
 
 pub struct VaapiEncoder {
     encoder: Option<ffmpeg::codec::encoder::Video>,
@@ -120,6 +120,7 @@ impl VideoEncoder for VaapiEncoder {
                     encoder.send_frame(&filtered)?;
                 }
             }
+
             let mut packet = ffmpeg::codec::packet::Packet::empty();
             if encoder.receive_packet(&mut packet).is_ok() {
                 if let Some(data) = packet.data() {
@@ -230,8 +231,9 @@ impl VaapiEncoder {
         encoder_ctx.set_format(ffmpeg::format::Pixel::VAAPI);
         // Configuration inspiration from
         // https://git.dec05eba.com/gpu-screen-recorder/tree/src/capture/xcomposite_drm.c?id=8cbdb596ebf79587a432ed40583630b6cd39ed88
-        let mut vaapi_device = Self::create_vaapi_device()?;
-        let mut frame_ctx = Self::create_vaapi_frame_ctx(vaapi_device)?;
+        let mut vaapi_device =
+            create_hw_device(ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI)?;
+        let mut frame_ctx = create_hw_frame_ctx(vaapi_device)?;
 
         unsafe {
             let hw_frame_context = &mut *((*frame_ctx).data as *mut AVHWFramesContext);
@@ -275,42 +277,6 @@ impl VaapiEncoder {
         encoder_ctx.set_parameters(encoder_params)?;
         let encoder = encoder_ctx.open_with(opts)?;
         Ok(encoder)
-    }
-
-    fn create_vaapi_frame_ctx(device: *mut AVBufferRef) -> Result<*mut AVBufferRef> {
-        unsafe {
-            let frame = av_hwframe_ctx_alloc(device);
-
-            if frame.is_null() {
-                return Err(WaycapError::Init(
-                    "Could not create vaapi frame context".to_string(),
-                ));
-            }
-
-            Ok(frame)
-        }
-    }
-
-    fn create_vaapi_device() -> Result<*mut AVBufferRef> {
-        unsafe {
-            let mut device: *mut AVBufferRef = null_mut();
-            let device_path = CString::new("/dev/dri/renderD128").unwrap();
-            let ret = av_hwdevice_ctx_create(
-                &mut device,
-                ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
-                device_path.as_ptr(),
-                null_mut(),
-                0,
-            );
-            if ret < 0 {
-                return Err(WaycapError::Init(format!(
-                    "Failed to create VAAPI device: Error code {}",
-                    ret
-                )));
-            }
-
-            Ok(device)
-        }
     }
 
     fn get_encoder_params(quality: &QualityPreset) -> ffmpeg::Dictionary {
@@ -373,7 +339,7 @@ impl VaapiEncoder {
         scale.link(0, &mut out, 0);
 
         graph.validate()?;
-        log::trace!("Graph\n{}", graph.dump());
+        log::trace!("VAAPI Graph\n{}", graph.dump());
 
         Ok(graph)
     }
