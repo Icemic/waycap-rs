@@ -1,8 +1,10 @@
+use std::ptr::null_mut;
+
+use drm_fourcc::DrmFourcc;
 use ffmpeg_next::{
     self as ffmpeg,
     ffi::{
-        av_buffer_ref, av_buffer_unref, av_hwframe_ctx_init, AVHWDeviceContext, AVHWFramesContext,
-        AVPixelFormat,
+        av_buffer_create, av_buffer_default_free, av_buffer_ref, av_buffer_unref, av_hwframe_ctx_init, AVDRMFrameDescriptor, AVHWDeviceContext, AVHWFramesContext, AVPixelFormat
     },
     Rational,
 };
@@ -27,6 +29,7 @@ pub struct NvencEncoder {
     quality: QualityPreset,
     encoded_frame_recv: Option<HeapCons<EncodedVideoFrame>>,
     encoded_frame_sender: Option<HeapProd<EncodedVideoFrame>>,
+    filter_graph: Option<ffmpeg::filter::Graph>,
 }
 
 impl VideoEncoder for NvencEncoder {
@@ -38,6 +41,7 @@ impl VideoEncoder for NvencEncoder {
         let encoder = Self::create_encoder(width, height, encoder_name, &quality)?;
         let video_ring_buffer = HeapRb::<EncodedVideoFrame>::new(120);
         let (video_ring_sender, video_ring_receiver) = video_ring_buffer.split();
+        let filter_graph = Some(Self::create_filter_graph(&encoder, width, height)?);
 
         Ok(Self {
             encoder: Some(encoder),
@@ -47,6 +51,7 @@ impl VideoEncoder for NvencEncoder {
             quality,
             encoded_frame_recv: Some(video_ring_receiver),
             encoded_frame_sender: Some(video_ring_sender),
+            filter_graph,
         })
     }
 
@@ -54,8 +59,67 @@ impl VideoEncoder for NvencEncoder {
         if let Some(ref mut encoder) = self.encoder {
             if let Some(fd) = frame.dmabuf_fd {
                 log::info!("Got dma buf {:?}", frame);
-                // TODO: Figure out how to turn the DMA Buf into an AVFrame I
-                // can pass to the encoder (DRM PRIME/similar approach to vaapi?)
+                let mut drm_frame = ffmpeg::util::frame::Video::new(
+                    ffmpeg_next::format::Pixel::DRM_PRIME,
+                    encoder.width(),
+                    encoder.height(),
+                );
+                
+                unsafe {
+                    // Create DRM descriptor that points to the DMA buffer
+                    let drm_desc =
+                        Box::into_raw(Box::new(std::mem::zeroed::<AVDRMFrameDescriptor>()));
+
+                    (*drm_desc).nb_objects = 1;
+                    (*drm_desc).objects[0].fd = fd;
+                    (*drm_desc).objects[0].size = frame.size as usize;
+                    (*drm_desc).objects[0].format_modifier = frame.modifier;
+
+                    (*drm_desc).nb_layers = 1;
+                    (*drm_desc).layers[0].format = DrmFourcc::Argb8888 as u32;
+                    (*drm_desc).layers[0].nb_planes = 1;
+                    (*drm_desc).layers[0].planes[0].object_index = 0;
+                    (*drm_desc).layers[0].planes[0].offset = frame.offset as isize;
+                    (*drm_desc).layers[0].planes[0].pitch = frame.stride as isize;
+
+                    // Attach descriptor to frame
+                    (*drm_frame.as_mut_ptr()).data[0] = drm_desc as *mut u8;
+                    (*drm_frame.as_mut_ptr()).buf[0] = av_buffer_create(
+                        drm_desc as *mut u8,
+                        std::mem::size_of::<AVDRMFrameDescriptor>(),
+                        Some(av_buffer_default_free),
+                        null_mut(),
+                        0,
+                    );
+
+                    (*drm_frame.as_mut_ptr()).hw_frames_ctx =
+                        av_buffer_ref((*encoder.as_ptr()).hw_frames_ctx);
+                }
+
+                drm_frame.set_pts(Some(frame.timestamp));
+                self.filter_graph
+                    .as_mut()
+                    .unwrap()
+                    .get("in")
+                    .unwrap()
+                    .source()
+                    .add(&drm_frame)
+                    .unwrap();
+
+                let mut filtered = ffmpeg::util::frame::Video::empty();
+                if self
+                    .filter_graph
+                    .as_mut()
+                    .unwrap()
+                    .get("out")
+                    .unwrap()
+                    .sink()
+                    .frame(&mut filtered)
+                    .is_ok()
+                {
+                    encoder.send_frame(&filtered)?;
+                }
+
             } else {
                 let mut src_frame = ffmpeg::util::frame::video::Video::new(
                     ffmpeg_next::format::Pixel::BGRA,
@@ -94,6 +158,21 @@ impl VideoEncoder for NvencEncoder {
 
     fn drain(&mut self) -> Result<()> {
         if let Some(ref mut encoder) = self.encoder {
+            // Drain the filter graph
+            let mut filtered = ffmpeg::util::frame::Video::empty();
+            while self
+                .filter_graph
+                .as_mut()
+                .unwrap()
+                .get("out")
+                .unwrap()
+                .sink()
+                .frame(&mut filtered)
+                .is_ok()
+            {
+                encoder.send_frame(&filtered)?;
+            }
+
             // Drain encoder
             encoder.send_eof()?;
             let mut packet = ffmpeg::codec::packet::Packet::empty();
@@ -168,7 +247,7 @@ impl NvencEncoder {
             let hw_frame_context = &mut *((*frame_ctx).data as *mut AVHWFramesContext);
             hw_frame_context.width = width as i32;
             hw_frame_context.height = height as i32;
-            hw_frame_context.sw_format = AVPixelFormat::AV_PIX_FMT_NV12;
+            hw_frame_context.sw_format = AVPixelFormat::AV_PIX_FMT_BGRA;
             hw_frame_context.format = encoder_ctx.format().into();
             hw_frame_context.device_ref = av_buffer_ref(nvenc_device);
             hw_frame_context.device_ctx = (*nvenc_device).data as *mut AVHWDeviceContext;
@@ -233,6 +312,59 @@ impl NvencEncoder {
             }
         }
         opts
+    }
+
+    fn create_filter_graph(
+        encoder: &ffmpeg::codec::encoder::Video,
+        width: u32,
+        height: u32,
+    ) -> Result<ffmpeg::filter::Graph> {
+        let mut graph = ffmpeg::filter::Graph::new();
+
+        let args = format!(
+            "video_size={}x{}:pix_fmt=drm_prime:time_base=1/1000000",
+            width, height
+        );
+
+        // TODO: Figure out how to set hw_frames_ctx on input (only see device ctx)
+        let mut input = graph.add(&ffmpeg::filter::find("buffer").unwrap(), "in", &args)?;
+
+        let mut hw_upload = graph.add(
+            &ffmpeg::filter::find("hwupload_cuda").unwrap(),
+            "hwupload_cuda",
+            "",
+        )?;
+
+        // let scale_args = format!("w={}:h={}:format=nv12:out_range=tv", width, height);
+        // let mut scale = graph.add(
+        //     &ffmpeg::filter::find("scale_vaapi").unwrap(),
+        //     "scale",
+        //     &scale_args,
+        // )?;
+
+        let mut out = graph.add(&ffmpeg::filter::find("buffersink").unwrap(), "out", "")?;
+        unsafe {
+            let dev = (*encoder.as_ptr()).hw_device_ctx;
+
+            (*hw_upload.as_mut_ptr()).hw_device_ctx = av_buffer_ref(dev);
+        }
+
+        input.link(0, &mut hw_upload, 0);
+
+        unsafe {
+            let input_ptr = input.as_mut_ptr();
+
+            let mut av_filter_link = **(*input_ptr).outputs;
+
+        }
+
+        hw_upload.link(0, &mut out, 0);
+        // scale.link(0, &mut out, 0);
+
+        graph.validate()?;
+        log::info!("NVENC Graph\n{}", graph.dump());
+
+        Ok(graph)
     }
 }
 
