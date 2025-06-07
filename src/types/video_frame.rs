@@ -20,3 +20,10 @@ pub struct RawVideoFrame {
     pub size: u32,
     pub modifier: u64,
 }
+
+#[derive(Debug)]
+pub struct DmaBufPlane {
+    pub fd: i32,
+    pub offset: u32,
+    pub stride: u32,
+}

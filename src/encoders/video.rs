@@ -4,6 +4,7 @@ use std::ptr::null_mut;
 use crate::types::error::{Result, WaycapError};
 use crate::types::video_frame::RawVideoFrame;
 use crate::types::{config::QualityPreset, video_frame::EncodedVideoFrame};
+use crate::waycap_egl::EglContext;
 use ffmpeg_next::ffi::{av_hwdevice_ctx_create, av_hwframe_ctx_alloc, AVBufferRef};
 use ffmpeg_next::{self as ffmpeg};
 use ringbuf::HeapCons;
@@ -20,6 +21,8 @@ pub trait VideoEncoder: Send {
     fn drop_encoder(&mut self);
     fn get_encoder(&self) -> &Option<ffmpeg::codec::encoder::Video>;
     fn take_encoded_recv(&mut self) -> Option<HeapCons<EncodedVideoFrame>>;
+    fn process_egl_texture(&mut self, id: u32, capture_time: i64) -> Result<()>;
+    fn enable_gl_interop_on_existing_context(&mut self, egl_ctx: &EglContext) -> Result<()>;
 }
 
 pub fn create_hw_frame_ctx(device: *mut AVBufferRef) -> Result<*mut AVBufferRef> {

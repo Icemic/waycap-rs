@@ -1,10 +1,10 @@
-use std::ptr::null_mut;
+use std::{ffi::c_void, ptr::null_mut};
 
-use drm_fourcc::DrmFourcc;
 use ffmpeg_next::{
     self as ffmpeg,
     ffi::{
-        av_buffer_create, av_buffer_default_free, av_buffer_ref, av_buffer_unref, av_hwframe_ctx_init, AVDRMFrameDescriptor, AVHWDeviceContext, AVHWFramesContext, AVPixelFormat
+        av_buffer_ref, av_buffer_unref, av_hwframe_ctx_init, AVHWDeviceContext, AVHWFramesContext,
+        AVPixelFormat,
     },
     Rational,
 };
@@ -13,13 +13,23 @@ use ringbuf::{
     HeapCons, HeapProd, HeapRb,
 };
 
-use crate::types::{
-    config::QualityPreset,
-    error::{Result, WaycapError},
-    video_frame::{EncodedVideoFrame, RawVideoFrame},
+use crate::{
+    types::{
+        config::QualityPreset,
+        error::{Result, WaycapError},
+        video_frame::{EncodedVideoFrame, RawVideoFrame},
+    },
+    waycap_egl::EglContext,
 };
 
-use super::video::{create_hw_device, create_hw_frame_ctx, VideoEncoder, GOP_SIZE};
+use super::{
+    cuda::{
+        cuCtxSetCurrent, cuGLCtxCreate, cuGraphicsGLRegisterImage, cuGraphicsMapResources,
+        cuGraphicsSubResourceGetMappedArray, cuGraphicsUnmapResources,
+        cuGraphicsUnregisterResource, cuMemcpy2D, AVCUDADeviceContext, CUDA_MEMCPY2D,
+    },
+    video::{create_hw_device, create_hw_frame_ctx, VideoEncoder, GOP_SIZE},
+};
 
 pub struct NvencEncoder {
     encoder: Option<ffmpeg::codec::encoder::Video>,
@@ -29,7 +39,6 @@ pub struct NvencEncoder {
     quality: QualityPreset,
     encoded_frame_recv: Option<HeapCons<EncodedVideoFrame>>,
     encoded_frame_sender: Option<HeapProd<EncodedVideoFrame>>,
-    filter_graph: Option<ffmpeg::filter::Graph>,
 }
 
 impl VideoEncoder for NvencEncoder {
@@ -41,7 +50,8 @@ impl VideoEncoder for NvencEncoder {
         let encoder = Self::create_encoder(width, height, encoder_name, &quality)?;
         let video_ring_buffer = HeapRb::<EncodedVideoFrame>::new(120);
         let (video_ring_sender, video_ring_receiver) = video_ring_buffer.split();
-        let filter_graph = Some(Self::create_filter_graph(&encoder, width, height)?);
+
+        // Self::test_gl_cuda_interop()?;
 
         Ok(Self {
             encoder: Some(encoder),
@@ -51,75 +61,164 @@ impl VideoEncoder for NvencEncoder {
             quality,
             encoded_frame_recv: Some(video_ring_receiver),
             encoded_frame_sender: Some(video_ring_sender),
-            filter_graph,
         })
+    }
+
+    fn enable_gl_interop_on_existing_context(&mut self, egl_ctx: &EglContext) -> Result<()> {
+        unsafe {
+            // Make sure EGL context is current
+            egl_ctx.make_current().unwrap();
+
+            if let Some(ref mut encoder) = self.encoder {
+                // Get FFmpeg's CUDA context
+                let hw_device_data =
+                    (*(*encoder.as_ptr()).hw_device_ctx).data as *mut AVHWDeviceContext;
+                let cuda_device_ctx = (*hw_device_data).hwctx as *mut AVCUDADeviceContext;
+                let ffmpeg_cuda_ctx = (*cuda_device_ctx).cuda_ctx;
+
+                log::info!("FFmpeg created CUDA context: {:p}", ffmpeg_cuda_ctx);
+
+                // Test if GL interop already works with this context
+                let result = Self::test_gl_interop_with_context(ffmpeg_cuda_ctx);
+                match result {
+                    Ok(_) => {
+                        log::info!("✓ GL interop already working with FFmpeg's CUDA context");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        log::warn!("GL interop not working with FFmpeg context: {}", e);
+                    }
+                }
+
+                // If basic interop doesn't work, we need to do something more
+                // Sometimes just setting the context current helps
+                cuCtxSetCurrent(std::ptr::null_mut());
+                let result = cuCtxSetCurrent(ffmpeg_cuda_ctx);
+                if result != 0 {
+                    return Err(format!("Failed to set FFmpeg CUDA context: {}", result).into());
+                }
+
+                // Test again
+                Self::test_gl_interop_with_context(ffmpeg_cuda_ctx)?;
+                log::info!("✓ GL interop enabled on FFmpeg's CUDA context");
+            }
+            Ok(())
+        }
+    }
+
+    fn process_egl_texture(&mut self, id: u32, capture_time: i64) -> Result<()> {
+        if let Some(ref mut encoder) = self.encoder {
+            log::info!("Got image {:?}", id);
+            let mut cuda_frame = ffmpeg::util::frame::Video::new(
+                ffmpeg_next::format::Pixel::CUDA,
+                encoder.width(),
+                encoder.height(),
+            );
+
+            unsafe {
+                // Re-use the same CUDA device as the encoder for everything
+                (*cuda_frame.as_mut_ptr()).hw_frames_ctx =
+                    av_buffer_ref((*encoder.as_ptr()).hw_frames_ctx);
+                // let hw_device_data =
+                //     (*(*encoder.as_ptr()).hw_device_ctx).data as *mut AVHWDeviceContext;
+                // let cuda_device_ctx = (*hw_device_data).hwctx as *mut AVCUDADeviceContext;
+
+                // let result = cuCtxSetCurrent(cuda_device_ctx as *mut c_void);
+                //
+                // if result < 0 {
+                //     return Err(WaycapError::Encoding(format!(
+                //         "Error setting current CUDA device: {:?}",
+                //         result
+                //     )));
+                // }
+
+                let mut cuda_resource: *mut c_void = null_mut();
+
+                let result = cuGraphicsGLRegisterImage(
+                    &mut cuda_resource,
+                    id,
+                    0x8D65, // GL_TEXTURE_2D
+                    0x01,   // CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD
+                );
+
+                if result != 0 {
+                    return Err(WaycapError::Encoding(format!(
+                        "Error registering the GL image to CUDA: {:?}",
+                        result
+                    )));
+                }
+
+                let result =
+                    cuGraphicsMapResources(1, cuda_resource as *const *mut c_void, null_mut());
+
+                if result != 0 {
+                    cuGraphicsUnregisterResource(cuda_resource);
+                    return Err(WaycapError::Encoding(format!(
+                        "Error mapping GL image to CUDA: {:?}",
+                        result
+                    )));
+                }
+
+                let mut cuda_array: *mut std::ffi::c_void = null_mut();
+                let result =
+                    cuGraphicsSubResourceGetMappedArray(&mut cuda_array, cuda_resource, 0, 0);
+
+                if result != 0 {
+                    cuGraphicsUnmapResources(1, cuda_resource as *const *mut c_void, null_mut());
+                    cuGraphicsUnregisterResource(cuda_resource);
+                    return Err(WaycapError::Encoding(format!(
+                        "Error getting CUDA Array: {:?}",
+                        result
+                    )));
+                }
+
+                let pitch = encoder.width() * 4;
+                let copy_params = CUDA_MEMCPY2D {
+                    srcXInBytes: 0,
+                    srcY: 0,
+                    srcMemoryType: 2, //CU_MEMORYTYPE_ARRAY
+                    srcHost: std::ptr::null(),
+                    srcDevice: std::ptr::null(),
+                    srcArray: cuda_array,
+                    srcPitch: 0, // ignored for arrays
+
+                    dstXInBytes: 0,
+                    dstY: 0,
+                    dstMemoryType: 1, // CU_MEMORYTYPE_DEVICE
+                    dstHost: std::ptr::null_mut(),
+                    dstDevice: (*cuda_frame.as_ptr()).data[0] as *mut c_void,
+                    dstArray: std::ptr::null_mut(),
+                    dstPitch: (*cuda_frame.as_ptr()).linesize[0] as usize,
+
+                    WidthInBytes: pitch as usize,
+                    Height: encoder.height() as usize,
+                };
+                let result = cuMemcpy2D(&copy_params as *const CUDA_MEMCPY2D);
+
+                cuGraphicsUnmapResources(1, cuda_resource as *const *mut c_void, null_mut());
+                cuGraphicsUnregisterResource(cuda_resource);
+
+                if result != 0 {
+                    return Err(WaycapError::Encoding(format!(
+                        "Error copying CUDA array to frame: {:?}",
+                        result
+                    )));
+                }
+            }
+
+            cuda_frame.set_pts(Some(capture_time));
+            cuda_frame.set_color_range(ffmpeg_next::color::Range::MPEG);
+
+            encoder.send_frame(&cuda_frame)?;
+        }
+
+        Ok(())
     }
 
     fn process(&mut self, frame: &RawVideoFrame) -> Result<()> {
         if let Some(ref mut encoder) = self.encoder {
             if let Some(fd) = frame.dmabuf_fd {
-                log::info!("Got dma buf {:?}", frame);
-                let mut drm_frame = ffmpeg::util::frame::Video::new(
-                    ffmpeg_next::format::Pixel::DRM_PRIME,
-                    encoder.width(),
-                    encoder.height(),
-                );
-                
-                unsafe {
-                    // Create DRM descriptor that points to the DMA buffer
-                    let drm_desc =
-                        Box::into_raw(Box::new(std::mem::zeroed::<AVDRMFrameDescriptor>()));
-
-                    (*drm_desc).nb_objects = 1;
-                    (*drm_desc).objects[0].fd = fd;
-                    (*drm_desc).objects[0].size = frame.size as usize;
-                    (*drm_desc).objects[0].format_modifier = frame.modifier;
-
-                    (*drm_desc).nb_layers = 1;
-                    (*drm_desc).layers[0].format = DrmFourcc::Argb8888 as u32;
-                    (*drm_desc).layers[0].nb_planes = 1;
-                    (*drm_desc).layers[0].planes[0].object_index = 0;
-                    (*drm_desc).layers[0].planes[0].offset = frame.offset as isize;
-                    (*drm_desc).layers[0].planes[0].pitch = frame.stride as isize;
-
-                    // Attach descriptor to frame
-                    (*drm_frame.as_mut_ptr()).data[0] = drm_desc as *mut u8;
-                    (*drm_frame.as_mut_ptr()).buf[0] = av_buffer_create(
-                        drm_desc as *mut u8,
-                        std::mem::size_of::<AVDRMFrameDescriptor>(),
-                        Some(av_buffer_default_free),
-                        null_mut(),
-                        0,
-                    );
-
-                    (*drm_frame.as_mut_ptr()).hw_frames_ctx =
-                        av_buffer_ref((*encoder.as_ptr()).hw_frames_ctx);
-                }
-
-                drm_frame.set_pts(Some(frame.timestamp));
-                self.filter_graph
-                    .as_mut()
-                    .unwrap()
-                    .get("in")
-                    .unwrap()
-                    .source()
-                    .add(&drm_frame)
-                    .unwrap();
-
-                let mut filtered = ffmpeg::util::frame::Video::empty();
-                if self
-                    .filter_graph
-                    .as_mut()
-                    .unwrap()
-                    .get("out")
-                    .unwrap()
-                    .sink()
-                    .frame(&mut filtered)
-                    .is_ok()
-                {
-                    encoder.send_frame(&filtered)?;
-                }
-
+                log::info!("Received dma frame: {:?}", frame);
             } else {
                 let mut src_frame = ffmpeg::util::frame::video::Video::new(
                     ffmpeg_next::format::Pixel::BGRA,
@@ -158,21 +257,6 @@ impl VideoEncoder for NvencEncoder {
 
     fn drain(&mut self) -> Result<()> {
         if let Some(ref mut encoder) = self.encoder {
-            // Drain the filter graph
-            let mut filtered = ffmpeg::util::frame::Video::empty();
-            while self
-                .filter_graph
-                .as_mut()
-                .unwrap()
-                .get("out")
-                .unwrap()
-                .sink()
-                .frame(&mut filtered)
-                .is_ok()
-            {
-                encoder.send_frame(&filtered)?;
-            }
-
             // Drain encoder
             encoder.send_eof()?;
             let mut packet = ffmpeg::codec::packet::Packet::empty();
@@ -245,6 +329,7 @@ impl NvencEncoder {
 
         unsafe {
             let hw_frame_context = &mut *((*frame_ctx).data as *mut AVHWFramesContext);
+
             hw_frame_context.width = width as i32;
             hw_frame_context.height = height as i32;
             hw_frame_context.sw_format = AVPixelFormat::AV_PIX_FMT_BGRA;
@@ -314,57 +399,107 @@ impl NvencEncoder {
         opts
     }
 
-    fn create_filter_graph(
-        encoder: &ffmpeg::codec::encoder::Video,
-        width: u32,
-        height: u32,
-    ) -> Result<ffmpeg::filter::Graph> {
-        let mut graph = ffmpeg::filter::Graph::new();
-
-        let args = format!(
-            "video_size={}x{}:pix_fmt=drm_prime:time_base=1/1000000",
-            width, height
-        );
-
-        // TODO: Figure out how to set hw_frames_ctx on input (only see device ctx)
-        let mut input = graph.add(&ffmpeg::filter::find("buffer").unwrap(), "in", &args)?;
-
-        let mut hw_upload = graph.add(
-            &ffmpeg::filter::find("hwupload_cuda").unwrap(),
-            "hwupload_cuda",
-            "",
-        )?;
-
-        // let scale_args = format!("w={}:h={}:format=nv12:out_range=tv", width, height);
-        // let mut scale = graph.add(
-        //     &ffmpeg::filter::find("scale_vaapi").unwrap(),
-        //     "scale",
-        //     &scale_args,
-        // )?;
-
-        let mut out = graph.add(&ffmpeg::filter::find("buffersink").unwrap(), "out", "")?;
+    fn test_gl_cuda_interop() -> Result<()> {
         unsafe {
-            let dev = (*encoder.as_ptr()).hw_device_ctx;
+            // Create a small test texture
+            let mut test_texture = 0;
+            gl::GenTextures(1, &mut test_texture);
+            gl::BindTexture(gl::TEXTURE_2D, test_texture);
 
-            (*hw_upload.as_mut_ptr()).hw_device_ctx = av_buffer_ref(dev);
+            // Create minimal texture data
+            let test_data = vec![255u8; 64 * 64 * 4]; // 64x64 RGBA
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA as i32,
+                64,
+                64,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                test_data.as_ptr() as *const std::ffi::c_void,
+            );
+
+            let gl_error = gl::GetError();
+            if gl_error != gl::NO_ERROR {
+                gl::DeleteTextures(1, &test_texture);
+                return Err(format!("GL error creating test texture: 0x{:x}", gl_error).into());
+            }
+
+            // Try to register with CUDA
+            let mut cuda_resource: *mut std::ffi::c_void = std::ptr::null_mut();
+            let result = cuGraphicsGLRegisterImage(
+                &mut cuda_resource,
+                test_texture,
+                0x0DE1, // GL_TEXTURE_2D
+                0x02,   // CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY
+            );
+
+            if result == 0 {
+                log::info!("✓ GL/CUDA interop test successful!");
+                cuGraphicsUnregisterResource(cuda_resource);
+            } else {
+                log::error!("✗ GL/CUDA interop test failed with error: {}", result);
+                gl::DeleteTextures(1, &test_texture);
+                return Err(format!("GL/CUDA interop not working: {}", result).into());
+            }
+
+            gl::DeleteTextures(1, &test_texture);
+            gl::BindTexture(gl::TEXTURE_2D, 0);
         }
 
-        input.link(0, &mut hw_upload, 0);
+        Ok(())
+    }
 
+    fn test_gl_interop_with_context(cuda_ctx: *mut std::ffi::c_void) -> Result<()> {
         unsafe {
-            let input_ptr = input.as_mut_ptr();
+            // Clear any current context first
+            cuCtxSetCurrent(std::ptr::null_mut());
 
-            let mut av_filter_link = **(*input_ptr).outputs;
+            // Set the context we want to test
+            let result = cuCtxSetCurrent(cuda_ctx);
+            if result != 0 {
+                return Err(format!("Failed to set context: {}", result).into());
+            }
 
+            // Create test texture
+            let mut test_texture = 0;
+            gl::GenTextures(1, &mut test_texture);
+            gl::BindTexture(gl::TEXTURE_2D, test_texture);
+
+            let test_data = vec![255u8; 32 * 32 * 4];
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA as i32,
+                32,
+                32,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                test_data.as_ptr() as *const std::ffi::c_void,
+            );
+
+            // Try to register
+            let mut cuda_resource: *mut std::ffi::c_void = std::ptr::null_mut();
+            let result = cuGraphicsGLRegisterImage(
+                &mut cuda_resource,
+                test_texture,
+                0x0DE1, // GL_TEXTURE_2D
+                0x02,   // READ_ONLY
+            );
+
+            // Cleanup
+            gl::DeleteTextures(1, &test_texture);
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+
+            if result == 0 {
+                cuGraphicsUnregisterResource(cuda_resource);
+                Ok(())
+            } else {
+                Err(format!("GL interop test failed: {}", result).into())
+            }
         }
-
-        hw_upload.link(0, &mut out, 0);
-        // scale.link(0, &mut out, 0);
-
-        graph.validate()?;
-        log::info!("NVENC Graph\n{}", graph.dump());
-
-        Ok(graph)
     }
 }
 

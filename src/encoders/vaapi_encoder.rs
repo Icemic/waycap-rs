@@ -1,4 +1,4 @@
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 
 use drm_fourcc::DrmFourcc;
 use ffmpeg_next::{
@@ -55,6 +55,18 @@ impl VideoEncoder for VaapiEncoder {
             encoded_frame_sender: Some(video_ring_sender),
             filter_graph,
         })
+    }
+
+    fn process_egl_texture(&mut self, id: u32, capture_timestamp: i64) -> Result<()> {
+        log::error!("Not implemented for vaapi");
+        Ok(())
+    }
+
+    fn enable_gl_interop_on_existing_context(
+        &mut self,
+        egl_ctx: &crate::waycap_egl::EglContext,
+    ) -> Result<()> {
+        Ok(())
     }
 
     fn process(&mut self, frame: &RawVideoFrame) -> Result<()> {

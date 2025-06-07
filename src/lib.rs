@@ -73,11 +73,15 @@ use types::{
     error::{Result, WaycapError},
     video_frame::{EncodedVideoFrame, RawVideoFrame},
 };
+use utils::{calculate_dimensions, extract_dmabuf_planes};
+use waycap_egl::EglContext;
 
 mod capture;
 mod encoders;
 pub mod pipeline;
 pub mod types;
+mod utils;
+mod waycap_egl;
 
 /// Main capture instance for recording screen content and audio.
 ///
@@ -158,13 +162,13 @@ impl Capture {
         let stream = active_cast.streams().next().unwrap();
         let stream_node = stream.pipewire_node();
 
-        let use_ram_copy = match video_encoder_type {
+        let use_nvenc_modifiers = match video_encoder_type {
             VideoEncoderType::H264Nvenc => true,
             VideoEncoderType::H264Vaapi => false,
         };
 
         let pw_video_capure = std::thread::spawn(move || {
-            let video_cap = VideoCapture::new(video_ready_pw, audio_ready_pw, use_ram_copy);
+            let video_cap = VideoCapture::new(video_ready_pw, audio_ready_pw, use_nvenc_modifiers);
             video_cap
                 .run(
                     fd,
@@ -252,6 +256,8 @@ impl Capture {
             Arc::clone(&stop),
             Arc::clone(&pause),
             target_fps,
+            width,
+            height,
         );
         join_handles.push(video_worker);
 
@@ -414,9 +420,14 @@ fn video_processor(
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
     target_fps: u64,
+    width: u32,
+    height: u32,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut last_timestamp: u64 = 0;
+        let egl_ctx = EglContext::new(width as i32, height as i32).unwrap();
+        let mut encoder_initialized = false;
+
         loop {
             if stop.load(Ordering::Acquire) {
                 break;
@@ -433,8 +444,31 @@ fn video_processor(
                     continue;
                 }
 
-                last_timestamp = current_time;
-                encoder.lock().unwrap().process(&raw_frame).unwrap();
+                match process_dmabuf_frame(&egl_ctx, &raw_frame) {
+                    Ok(egl_id) => {
+                        log::info!("EGL ID: {:?}", egl_id);
+                        if !encoder_initialized {
+                            encoder
+                                .lock()
+                                .unwrap()
+                                .enable_gl_interop_on_existing_context(&egl_ctx)
+                                .unwrap();
+                            encoder_initialized = true;
+                        }
+
+                        encoder
+                            .lock()
+                            .unwrap()
+                            .process_egl_texture(egl_id, raw_frame.timestamp)
+                            .unwrap();
+                        last_timestamp = current_time;
+                    }
+                    Err(_) => {
+                        log::info!("Falling back to sw encoding");
+                        encoder.lock().unwrap().process(&raw_frame).unwrap();
+                        last_timestamp = current_time;
+                    }
+                }
             }
 
             std::thread::sleep(Duration::from_nanos(100));
@@ -464,4 +498,32 @@ fn audio_processor(
 
         std::thread::sleep(Duration::from_nanos(100));
     })
+}
+
+fn process_dmabuf_frame(egl_ctx: &EglContext, raw_frame: &RawVideoFrame) -> Result<u32> {
+    let dma_buf_planes = extract_dmabuf_planes(raw_frame)?;
+
+    let format = drm_fourcc::DrmFourcc::Argb8888 as u32;
+    let (width, height) = calculate_dimensions(raw_frame)?;
+    let modifier = raw_frame.modifier;
+
+    let egl_image = egl_ctx
+        .create_image_from_dmabuf(&dma_buf_planes, format, width, height, modifier)
+        .unwrap();
+
+    let gl_texture_id = egl_ctx.bind_image_to_texture(egl_image).unwrap();
+
+    // let pixels = egl_ctx
+    //     .extract_pixels_from_egl_image(&egl_image, width, height)
+    //     .unwrap();
+
+    // EglContext::save_pixels_as_png(
+    //     &pixels,
+    //     width,
+    //     height,
+    //     &format!("Image-{}.png", gl_texture_id).to_string(),
+    // )
+    // .unwrap();
+
+    Ok(gl_texture_id)
 }
