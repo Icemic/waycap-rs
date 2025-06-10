@@ -202,6 +202,9 @@ impl Capture {
 
         join_handles.push(pw_video_capure);
 
+        let egl_context = EglContext::new(width as i32, height as i32).unwrap();
+        egl_context.make_current().unwrap();
+
         let video_encoder: Arc<Mutex<dyn VideoEncoder + Send>> = match video_encoder_type {
             VideoEncoderType::H264Nvenc => {
                 Arc::new(Mutex::new(NvencEncoder::new(width, height, quality)?))
@@ -256,9 +259,9 @@ impl Capture {
             Arc::clone(&stop),
             Arc::clone(&pause),
             target_fps,
-            width,
-            height,
+            egl_context,
         );
+
         join_handles.push(video_worker);
 
         // Wait till both threads are ready
@@ -420,13 +423,12 @@ fn video_processor(
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
     target_fps: u64,
-    width: u32,
-    height: u32,
+    egl_ctx: EglContext,
 ) -> std::thread::JoinHandle<()> {
+    egl_ctx.release_current().unwrap();
     std::thread::spawn(move || {
         let mut last_timestamp: u64 = 0;
-        let egl_ctx = EglContext::new(width as i32, height as i32).unwrap();
-        let mut encoder_initialized = false;
+        egl_ctx.make_current().unwrap();
 
         loop {
             if stop.load(Ordering::Acquire) {
@@ -447,15 +449,6 @@ fn video_processor(
                 match process_dmabuf_frame(&egl_ctx, &raw_frame) {
                     Ok(egl_id) => {
                         log::info!("EGL ID: {:?}", egl_id);
-                        if !encoder_initialized {
-                            encoder
-                                .lock()
-                                .unwrap()
-                                .enable_gl_interop_on_existing_context(&egl_ctx)
-                                .unwrap();
-                            encoder_initialized = true;
-                        }
-
                         encoder
                             .lock()
                             .unwrap()
@@ -501,6 +494,7 @@ fn audio_processor(
 }
 
 fn process_dmabuf_frame(egl_ctx: &EglContext, raw_frame: &RawVideoFrame) -> Result<u32> {
+    log::info!("Processing new frame");
     let dma_buf_planes = extract_dmabuf_planes(raw_frame)?;
 
     let format = drm_fourcc::DrmFourcc::Argb8888 as u32;

@@ -3,8 +3,8 @@ use std::{ffi::c_void, ptr::null_mut};
 use ffmpeg_next::{
     self as ffmpeg,
     ffi::{
-        av_buffer_ref, av_buffer_unref, av_hwframe_ctx_init, AVHWDeviceContext, AVHWFramesContext,
-        AVPixelFormat,
+        av_buffer_ref, av_buffer_unref, av_hwframe_ctx_init, av_hwframe_get_buffer,
+        AVHWDeviceContext, AVHWFramesContext, AVPixelFormat,
     },
     Rational,
 };
@@ -14,6 +14,10 @@ use ringbuf::{
 };
 
 use crate::{
+    encoders::cuda::{
+        cuArrayGetDescriptor, cuCtxGetCurrent, cuGraphicsResourceSetMapFlags, CUarray_format,
+        CUmemorytype, CUDA_ARRAY_DESCRIPTOR, CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE,
+    },
     types::{
         config::QualityPreset,
         error::{Result, WaycapError},
@@ -24,11 +28,13 @@ use crate::{
 
 use super::{
     cuda::{
-        cuCtxSetCurrent, cuGLCtxCreate, cuGraphicsGLRegisterImage, cuGraphicsMapResources,
+        cuCtxSetCurrent, cuGraphicsGLRegisterImage, cuGraphicsMapResources,
         cuGraphicsSubResourceGetMappedArray, cuGraphicsUnmapResources,
         cuGraphicsUnregisterResource, cuMemcpy2D, AVCUDADeviceContext, CUDA_MEMCPY2D,
     },
-    video::{create_hw_device, create_hw_frame_ctx, VideoEncoder, GOP_SIZE},
+    video::{
+        create_hw_device, create_hw_device_with_opts, create_hw_frame_ctx, VideoEncoder, GOP_SIZE,
+    },
 };
 
 pub struct NvencEncoder {
@@ -51,7 +57,7 @@ impl VideoEncoder for NvencEncoder {
         let video_ring_buffer = HeapRb::<EncodedVideoFrame>::new(120);
         let (video_ring_sender, video_ring_receiver) = video_ring_buffer.split();
 
-        // Self::test_gl_cuda_interop()?;
+        Self::test_gl_cuda_interop()?;
 
         Ok(Self {
             encoder: Some(encoder),
@@ -64,51 +70,10 @@ impl VideoEncoder for NvencEncoder {
         })
     }
 
-    fn enable_gl_interop_on_existing_context(&mut self, egl_ctx: &EglContext) -> Result<()> {
-        unsafe {
-            // Make sure EGL context is current
-            egl_ctx.make_current().unwrap();
-
-            if let Some(ref mut encoder) = self.encoder {
-                // Get FFmpeg's CUDA context
-                let hw_device_data =
-                    (*(*encoder.as_ptr()).hw_device_ctx).data as *mut AVHWDeviceContext;
-                let cuda_device_ctx = (*hw_device_data).hwctx as *mut AVCUDADeviceContext;
-                let ffmpeg_cuda_ctx = (*cuda_device_ctx).cuda_ctx;
-
-                log::info!("FFmpeg created CUDA context: {:p}", ffmpeg_cuda_ctx);
-
-                // Test if GL interop already works with this context
-                let result = Self::test_gl_interop_with_context(ffmpeg_cuda_ctx);
-                match result {
-                    Ok(_) => {
-                        log::info!("✓ GL interop already working with FFmpeg's CUDA context");
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        log::warn!("GL interop not working with FFmpeg context: {}", e);
-                    }
-                }
-
-                // If basic interop doesn't work, we need to do something more
-                // Sometimes just setting the context current helps
-                cuCtxSetCurrent(std::ptr::null_mut());
-                let result = cuCtxSetCurrent(ffmpeg_cuda_ctx);
-                if result != 0 {
-                    return Err(format!("Failed to set FFmpeg CUDA context: {}", result).into());
-                }
-
-                // Test again
-                Self::test_gl_interop_with_context(ffmpeg_cuda_ctx)?;
-                log::info!("✓ GL interop enabled on FFmpeg's CUDA context");
-            }
-            Ok(())
-        }
-    }
-
     fn process_egl_texture(&mut self, id: u32, capture_time: i64) -> Result<()> {
         if let Some(ref mut encoder) = self.encoder {
-            log::info!("Got image {:?}", id);
+            log::info!("Got texture {}", id);
+
             let mut cuda_frame = ffmpeg::util::frame::Video::new(
                 ffmpeg_next::format::Pixel::CUDA,
                 encoder.width(),
@@ -116,45 +81,112 @@ impl VideoEncoder for NvencEncoder {
             );
 
             unsafe {
-                // Re-use the same CUDA device as the encoder for everything
-                (*cuda_frame.as_mut_ptr()).hw_frames_ctx =
-                    av_buffer_ref((*encoder.as_ptr()).hw_frames_ctx);
-                // let hw_device_data =
-                //     (*(*encoder.as_ptr()).hw_device_ctx).data as *mut AVHWDeviceContext;
-                // let cuda_device_ctx = (*hw_device_data).hwctx as *mut AVCUDADeviceContext;
+                // Set up CUDA context from encoder
+                let hw_device_data =
+                    (*(*encoder.as_ptr()).hw_device_ctx).data as *mut AVHWDeviceContext;
 
-                // let result = cuCtxSetCurrent(cuda_device_ctx as *mut c_void);
-                //
-                // if result < 0 {
-                //     return Err(WaycapError::Encoding(format!(
-                //         "Error setting current CUDA device: {:?}",
-                //         result
-                //     )));
-                // }
-
-                let mut cuda_resource: *mut c_void = null_mut();
-
-                let result = cuGraphicsGLRegisterImage(
-                    &mut cuda_resource,
-                    id,
-                    0x8D65, // GL_TEXTURE_2D
-                    0x01,   // CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD
+                let ret = av_hwframe_get_buffer(
+                    (*encoder.as_ptr()).hw_frames_ctx,
+                    cuda_frame.as_mut_ptr(),
+                    0,
                 );
+                if ret < 0 {
+                    return Err(WaycapError::Encoding(format!(
+                        "Failed to allocate CUDA frame buffer: {}",
+                        ret
+                    )));
+                }
 
+                let cuda_device_ctx = (*hw_device_data).hwctx as *mut AVCUDADeviceContext;
+                let encoder_cuda_ctx = (*cuda_device_ctx).cuda_ctx;
+
+                // Check if context is valid before using it
+                if encoder_cuda_ctx.is_null() {
+                    return Err(WaycapError::Encoding("CUDA context is null".into()));
+                }
+
+                log::info!("Encoder CUDA context: {:p}", encoder_cuda_ctx);
+
+                // Check current context
+                let mut current_ctx: *mut std::ffi::c_void = std::ptr::null_mut();
+                let result = cuCtxGetCurrent(&mut current_ctx);
                 if result != 0 {
                     return Err(WaycapError::Encoding(format!(
-                        "Error registering the GL image to CUDA: {:?}",
+                        "Failed to get current CUDA context: {}",
                         result
                     )));
                 }
 
-                let result =
-                    cuGraphicsMapResources(1, cuda_resource as *const *mut c_void, null_mut());
+                log::info!("Current CUDA context: {:p}", current_ctx);
+
+                // If no context is current or different context, set the encoder's context
+                if current_ctx != encoder_cuda_ctx {
+                    let result = cuCtxSetCurrent(encoder_cuda_ctx);
+                    if result != 0 {
+                        return Err(WaycapError::Encoding(format!(
+                            "Failed to set encoder CUDA context: {} (context may be destroyed)",
+                            result
+                        )));
+                    }
+                    log::info!("Set encoder context as current");
+
+                    // Verify context is actually current now
+                    cuCtxGetCurrent(&mut current_ctx);
+                    if current_ctx != encoder_cuda_ctx {
+                        return Err(WaycapError::Encoding(
+                            "Failed to make encoder context current".into(),
+                        ));
+                    }
+                }
+
+                // Try to register GL texture with CUDA
+                let mut cuda_resource: *mut c_void = null_mut();
+                let result = cuGraphicsGLRegisterImage(
+                    &mut cuda_resource,
+                    id,
+                    gl::TEXTURE_2D, // GL_TEXTURE_2D
+                    0x00,           // CU_GRAPHICS_REGISTER_FLAGS_READ_NONE
+                );
 
                 if result != 0 {
-                    cuGraphicsUnregisterResource(cuda_resource);
+                    let error_msg = match result {
+                        709 => "Context destroyed or not initialized",
+                        1 => "Invalid value",
+                        201 => "Context already current",
+                        205 => "Invalid graphics context",
+                        _ => "Unknown error",
+                    };
                     return Err(WaycapError::Encoding(format!(
-                        "Error mapping GL image to CUDA: {:?}",
+                        "Error registering GL texture to CUDA: {} ({}) - {}",
+                        result, result, error_msg
+                    )));
+                }
+
+                log::info!("Successfully registered texture {}", id);
+
+                let result = cuGraphicsResourceSetMapFlags(
+                    cuda_resource,
+                    CU_GRAPHICS_MAP_RESOURCE_FLAGS_NONE,
+                );
+
+                if result != 0 {
+                    log::error!("cuGraphicsResourceSetMapFlags failed: {}", result);
+                    cuGraphicsUnregisterResource(cuda_resource);
+                    gl::BindTexture(gl::TEXTURE_2D, 0);
+                    return Err(WaycapError::Encoding(format!(
+                        "Failed to set graphics resource map flags: {}",
+                        result
+                    )));
+                }
+
+                log::info!("✓ Set graphics resource map flags");
+
+                let result = cuGraphicsMapResources(1, &cuda_resource, null_mut());
+                if result != 0 {
+                    cuGraphicsUnregisterResource(cuda_resource);
+                    gl::BindTexture(gl::TEXTURE_2D, 0);
+                    return Err(WaycapError::Encoding(format!(
+                        "Error mapping GL image to CUDA: {}",
                         result
                     )));
                 }
@@ -162,53 +194,73 @@ impl VideoEncoder for NvencEncoder {
                 let mut cuda_array: *mut std::ffi::c_void = null_mut();
                 let result =
                     cuGraphicsSubResourceGetMappedArray(&mut cuda_array, cuda_resource, 0, 0);
-
                 if result != 0 {
-                    cuGraphicsUnmapResources(1, cuda_resource as *const *mut c_void, null_mut());
+                    cuGraphicsUnmapResources(1, &cuda_resource, null_mut());
                     cuGraphicsUnregisterResource(cuda_resource);
+                    gl::BindTexture(gl::TEXTURE_2D, 0);
                     return Err(WaycapError::Encoding(format!(
-                        "Error getting CUDA Array: {:?}",
+                        "Error getting CUDA Array: {}",
                         result
                     )));
                 }
 
-                let pitch = encoder.width() * 4;
                 let copy_params = CUDA_MEMCPY2D {
                     srcXInBytes: 0,
                     srcY: 0,
-                    srcMemoryType: 2, //CU_MEMORYTYPE_ARRAY
+                    srcMemoryType: CUmemorytype::CU_MEMORYTYPE_ARRAY as u32,
                     srcHost: std::ptr::null(),
-                    srcDevice: std::ptr::null(),
+                    srcDevice: 0,
                     srcArray: cuda_array,
-                    srcPitch: 0, // ignored for arrays
+                    srcPitch: encoder.width() as usize, // ← C code uses frame->width, NOT 0!
 
                     dstXInBytes: 0,
                     dstY: 0,
-                    dstMemoryType: 1, // CU_MEMORYTYPE_DEVICE
+                    dstMemoryType: CUmemorytype::CU_MEMORYTYPE_DEVICE as u32,
                     dstHost: std::ptr::null_mut(),
-                    dstDevice: (*cuda_frame.as_ptr()).data[0] as *mut c_void,
+                    dstDevice: (*cuda_frame.as_ptr()).data[0] as u64,
                     dstArray: std::ptr::null_mut(),
                     dstPitch: (*cuda_frame.as_ptr()).linesize[0] as usize,
 
-                    WidthInBytes: pitch as usize,
+                    WidthInBytes: encoder.width() as usize, // ← C code uses frame->width, NOT width*4!
                     Height: encoder.height() as usize,
                 };
-                let result = cuMemcpy2D(&copy_params as *const CUDA_MEMCPY2D);
 
-                cuGraphicsUnmapResources(1, cuda_resource as *const *mut c_void, null_mut());
+                log::info!("Copy parameters (matching C code):");
+                log::info!("  srcPitch: {} (C: frame->width)", copy_params.srcPitch);
+                log::info!(
+                    "  dstPitch: {} (C: frame->linesize[0])",
+                    copy_params.dstPitch
+                );
+                log::info!(
+                    "  WidthInBytes: {} (C: frame->width)",
+                    copy_params.WidthInBytes
+                );
+                log::info!("  Height: {}", copy_params.Height);
+
+                let mut current_ctx: *mut std::ffi::c_void = std::ptr::null_mut();
+                cuCtxGetCurrent(&mut current_ctx);
+                log::info!("Current context before cuMemcpy2D: {:p}", current_ctx);
+
+                let result = cuMemcpy2D(&copy_params);
+                log::info!("cuMemcpy2D with C-style params result: {}", result);
+
+                // Cleanup
+                cuGraphicsUnmapResources(1, &cuda_resource, null_mut());
                 cuGraphicsUnregisterResource(cuda_resource);
+                gl::BindTexture(gl::TEXTURE_2D, 0);
 
                 if result != 0 {
                     return Err(WaycapError::Encoding(format!(
-                        "Error copying CUDA array to frame: {:?}",
+                        "Error copying CUDA array to frame: {}",
                         result
                     )));
                 }
+
+                log::info!("Successfully copied texture {} to CUDA frame", id);
             }
 
             cuda_frame.set_pts(Some(capture_time));
             cuda_frame.set_color_range(ffmpeg_next::color::Range::MPEG);
-
             encoder.send_frame(&cuda_frame)?;
         }
 
@@ -323,8 +375,16 @@ impl NvencEncoder {
         encoder_ctx.set_format(ffmpeg::format::Pixel::CUDA);
         encoder_ctx.set_bit_rate(16_000_000);
 
-        let mut nvenc_device =
-            create_hw_device(ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA)?;
+        let mut opts = ffmpeg::Dictionary::new();
+
+        // Reuse the same context as EGL
+        // to allow open gl interop
+        opts.set("primary_ctx", "1");
+        let mut nvenc_device = create_hw_device_with_opts(
+            ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_CUDA,
+            opts,
+        )?;
+
         let mut frame_ctx = create_hw_frame_ctx(nvenc_device)?;
 
         unsafe {
@@ -351,6 +411,21 @@ impl NvencEncoder {
 
             (*encoder_ctx.as_mut_ptr()).hw_device_ctx = av_buffer_ref(nvenc_device);
             (*encoder_ctx.as_mut_ptr()).hw_frames_ctx = av_buffer_ref(frame_ctx);
+
+            let hw_devc = (*nvenc_device).data as *mut AVHWDeviceContext;
+            let nvenc_dvc = (*hw_devc).hwctx as *mut AVCUDADeviceContext;
+
+            if (*nvenc_dvc).cuda_ctx.is_null() {
+                return Err(WaycapError::Init("FFmpeg CUDA context is null".to_string()));
+            }
+
+            let result = cuCtxSetCurrent((*nvenc_dvc).cuda_ctx);
+            if result != 0 {
+                return Err(WaycapError::Init(format!(
+                    "Failed to set FFmpeg CUDA context current: {}",
+                    result
+                )));
+            }
 
             av_buffer_unref(&mut nvenc_device);
             av_buffer_unref(&mut frame_ctx);
@@ -402,6 +477,24 @@ impl NvencEncoder {
     fn test_gl_cuda_interop() -> Result<()> {
         unsafe {
             // Create a small test texture
+            let mut current_context = std::ptr::null_mut();
+            let result = cuCtxGetCurrent(&mut current_context);
+            if result != 0 || current_context.is_null() {
+                return Err(format!(
+                    "No CUDA context is current after encoder creation, {:?}",
+                    result
+                )
+                .into());
+            }
+
+            log::info!("✓ CUDA context exists after encoder creation");
+            let gl_error = gl::GetError();
+
+            if gl_error != gl::NO_ERROR {
+                return Err(
+                    format!("OpenGL error before CUDA registration: 0x{:x}", gl_error).into(),
+                );
+            }
             let mut test_texture = 0;
             gl::GenTextures(1, &mut test_texture);
             gl::BindTexture(gl::TEXTURE_2D, test_texture);
@@ -456,6 +549,12 @@ impl NvencEncoder {
             // Clear any current context first
             cuCtxSetCurrent(std::ptr::null_mut());
 
+            let gl_error = gl::GetError();
+            if gl_error != gl::NO_ERROR {
+                return Err(
+                    format!("OpenGL error before CUDA registration: 0x{:x}", gl_error).into(),
+                );
+            }
             // Set the context we want to test
             let result = cuCtxSetCurrent(cuda_ctx);
             if result != 0 {

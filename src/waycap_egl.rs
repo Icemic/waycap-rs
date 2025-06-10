@@ -7,12 +7,15 @@ use crate::types::video_frame::DmaBufPlane;
 type PFNGLEGLIMAGETARGETTEXTURE2DOESPROC =
     unsafe extern "C" fn(target: gl::types::GLenum, image: *const c_void);
 
+unsafe impl Sync for EglContext {}
+unsafe impl Send for EglContext {}
+
 pub struct EglContext {
     egl_instance: Instance<Dynamic<libloading::Library, egl::EGL1_5>>,
     display: egl::Display,
     context: egl::Context,
     surface: egl::Surface,
-    config: egl::Config,
+    _config: egl::Config,
     dmabuf_supported: bool,
     dmabuf_modifiers_supported: bool,
 
@@ -68,7 +71,7 @@ impl EglContext {
         Ok(Self {
             egl_instance,
             display,
-            config,
+            _config: config,
             context,
             surface,
             dmabuf_supported,
@@ -106,8 +109,6 @@ impl EglContext {
         if !self.dmabuf_supported {
             return Err("DMA-BUF import not supported".into());
         }
-
-        self.make_current()?;
 
         let mut attributes = vec![
             // EGL_LINUX_DRM_FOURCC_EXT
@@ -216,8 +217,6 @@ impl EglContext {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        self.make_current()?;
-
         unsafe {
             // Create framebuffer and texture
             let mut fbo = 0;
@@ -325,8 +324,6 @@ impl EglContext {
         &self,
         image: egl::Image,
     ) -> Result<u32, Box<dyn std::error::Error>> {
-        self.make_current()?;
-
         let mut texture_id = 0;
         unsafe {
             gl::GenTextures(1, &mut texture_id);
@@ -349,6 +346,95 @@ impl EglContext {
 
             egl_texture_2d.unwrap()(gl::TEXTURE_2D, image.as_ptr());
 
+            let mut width = 0;
+            let mut height = 0;
+            let mut internal_format = 0;
+            gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut width);
+            gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &mut height);
+            gl::GetTexLevelParameteriv(
+                gl::TEXTURE_2D,
+                0,
+                gl::TEXTURE_INTERNAL_FORMAT,
+                &mut internal_format,
+            );
+
+            log::info!(
+                "EGL image created texture with format: 0x{:x}",
+                internal_format
+            );
+
+            if internal_format == gl::RGBA as i32 {
+                log::info!("Converting unsized RGBA to RGBA8 for CUDA compatibility");
+
+                // Create a new texture with proper format
+                let mut cuda_compatible_texture = 0;
+                gl::GenTextures(1, &mut cuda_compatible_texture);
+                gl::BindTexture(gl::TEXTURE_2D, cuda_compatible_texture);
+
+                // Allocate with RGBA8 format
+                gl::TexImage2D(
+                    gl::TEXTURE_2D,
+                    0,
+                    gl::RGBA8 as i32, // CUDA-compatible format
+                    width as i32,
+                    height as i32,
+                    0,
+                    gl::RGBA,
+                    gl::UNSIGNED_BYTE,
+                    std::ptr::null(),
+                );
+
+                // Copy from EGL texture to CUDA-compatible texture using FBO
+                let mut fbo = 0;
+                gl::GenFramebuffers(1, &mut fbo);
+                gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+
+                // Attach EGL texture as source
+                gl::FramebufferTexture2D(
+                    gl::FRAMEBUFFER,
+                    gl::COLOR_ATTACHMENT0,
+                    gl::TEXTURE_2D,
+                    texture_id, // EGL texture
+                    0,
+                );
+
+                // Check framebuffer status
+                let status = gl::CheckFramebufferStatus(gl::FRAMEBUFFER);
+                if status != gl::FRAMEBUFFER_COMPLETE {
+                    gl::DeleteFramebuffers(1, &fbo);
+                    gl::DeleteTextures(1, &cuda_compatible_texture);
+                    gl::DeleteTextures(1, &texture_id);
+                    return Err(format!("Framebuffer not complete: 0x{:x}", status).into());
+                }
+
+                // Copy to CUDA-compatible texture
+                gl::BindTexture(gl::TEXTURE_2D, cuda_compatible_texture);
+                gl::CopyTexImage2D(
+                    gl::TEXTURE_2D,
+                    0,
+                    gl::RGBA8, // CUDA-compatible format
+                    0,
+                    0, // x, y offset in framebuffer
+                    width as i32,
+                    height as i32,
+                    0, // border
+                );
+
+                // Cleanup
+                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+                gl::DeleteFramebuffers(1, &fbo);
+                gl::DeleteTextures(1, &texture_id); // Delete EGL texture
+
+                // Return the CUDA-compatible texture
+                gl::BindTexture(gl::TEXTURE_2D, 0);
+
+                log::info!(
+                    "✓ Created CUDA-compatible texture: ID {}",
+                    cuda_compatible_texture
+                );
+                return Ok(cuda_compatible_texture);
+            }
+
             if gl::GetError() == gl::NO_ERROR {
                 let mut width = 0;
                 gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut width);
@@ -358,10 +444,7 @@ impl EglContext {
 
                 gl::BindTexture(gl::TEXTURE_2D, 0);
 
-                log::info!(
-                    "✓ Bound EGL image to GL_TEXTURE_2D: {}",
-                    texture_id
-                );
+                log::info!("✓ Bound EGL image to GL_TEXTURE_2D: {}", texture_id);
                 return Ok(texture_id);
             }
 
@@ -407,6 +490,12 @@ impl EglContext {
         Ok(())
     }
 
+    pub fn release_current(&self) -> Result<(), egl::Error> {
+        self.egl_instance
+            .make_current(self.display, None, None, None)?;
+        Ok(())
+    }
+
     pub fn get_egl_instance(&self) -> &Instance<Dynamic<libloading::Library, egl::EGL1_5>> {
         &self.egl_instance
     }
@@ -416,8 +505,6 @@ impl EglContext {
     }
 
     pub fn test_opengl(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.make_current()?;
-
         let version = unsafe {
             let data = gl::GetString(gl::VERSION) as *const i8;
             if data.is_null() {
