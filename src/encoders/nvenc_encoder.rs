@@ -1,4 +1,4 @@
-use std::{ffi::c_void, ptr::null_mut};
+use std::{any::Any, ffi::c_void, ptr::null_mut};
 
 use ffmpeg_next::{
     self as ffmpeg,
@@ -53,14 +53,11 @@ impl VideoEncoder for NvencEncoder {
         Self: Sized,
     {
         let encoder_name = "h264_nvenc";
-        let encoder = Self::create_encoder(width, height, encoder_name, &quality)?;
         let video_ring_buffer = HeapRb::<EncodedVideoFrame>::new(120);
         let (video_ring_sender, video_ring_receiver) = video_ring_buffer.split();
 
-        Self::test_gl_cuda_interop()?;
-
         Ok(Self {
-            encoder: Some(encoder),
+            encoder: None,
             width,
             height,
             encoder_name: encoder_name.to_string(),
@@ -68,6 +65,14 @@ impl VideoEncoder for NvencEncoder {
             encoded_frame_recv: Some(video_ring_receiver),
             encoded_frame_sender: Some(video_ring_sender),
         })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 
     fn process_egl_texture(&mut self, id: u32, capture_time: i64) -> Result<()> {
@@ -599,6 +604,23 @@ impl NvencEncoder {
                 Err(format!("GL interop test failed: {}", result).into())
             }
         }
+    }
+
+    pub fn initialize_encoder(&mut self) -> Result<()> {
+        if self.encoder.is_some() {
+            return Ok(()); // Already initialized
+        }
+
+        self.encoder = Some(Self::create_encoder(
+            self.width,
+            self.height,
+            "h264_nvenc",
+            &self.quality,
+        )?);
+
+        Self::test_gl_cuda_interop()?;
+
+        Ok(())
     }
 }
 

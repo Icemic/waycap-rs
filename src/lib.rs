@@ -62,6 +62,8 @@ use encoders::{
     audio::AudioEncoder, nvenc_encoder::NvencEncoder, opus_encoder::OpusEncoder,
     vaapi_encoder::VaapiEncoder, video::VideoEncoder,
 };
+use khronos_egl::Downcast;
+use pipewire::sys::_IO_wide_data;
 use portal_screencast_waycap::{CursorMode, ScreenCast, SourceType};
 use ringbuf::{
     traits::{Consumer, Split},
@@ -202,9 +204,6 @@ impl Capture {
 
         join_handles.push(pw_video_capure);
 
-        let egl_context = EglContext::new(width as i32, height as i32).unwrap();
-        egl_context.make_current().unwrap();
-
         let video_encoder: Arc<Mutex<dyn VideoEncoder + Send>> = match video_encoder_type {
             VideoEncoderType::H264Nvenc => {
                 Arc::new(Mutex::new(NvencEncoder::new(width, height, quality)?))
@@ -259,7 +258,8 @@ impl Capture {
             Arc::clone(&stop),
             Arc::clone(&pause),
             target_fps,
-            egl_context,
+            width,
+            height,
         );
 
         join_handles.push(video_worker);
@@ -423,12 +423,27 @@ fn video_processor(
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
     target_fps: u64,
-    egl_ctx: EglContext,
+    width: u32,
+    height: u32,
 ) -> std::thread::JoinHandle<()> {
-    egl_ctx.release_current().unwrap();
     std::thread::spawn(move || {
+        let is_nvenc = encoder.lock().unwrap().as_any().is::<NvencEncoder>();
+
+        let egl_context = EglContext::new(width as i32, height as i32).unwrap();
+        egl_context.make_current().unwrap();
+
+        if is_nvenc {
+            encoder
+                .lock()
+                .unwrap()
+                .as_any_mut()
+                .downcast_mut::<NvencEncoder>()
+                .unwrap()
+                .initialize_encoder()
+                .unwrap();
+        }
+
         let mut last_timestamp: u64 = 0;
-        egl_ctx.make_current().unwrap();
 
         loop {
             if stop.load(Ordering::Acquire) {
@@ -439,6 +454,7 @@ fn video_processor(
                 std::thread::sleep(Duration::from_nanos(100));
                 continue;
             }
+
             while let Some(raw_frame) = video_recv.try_pop() {
                 let current_time = raw_frame.timestamp as u64;
 
@@ -446,7 +462,7 @@ fn video_processor(
                     continue;
                 }
 
-                match process_dmabuf_frame(&egl_ctx, &raw_frame) {
+                match process_dmabuf_frame(&egl_context, &raw_frame) {
                     Ok(egl_id) => {
                         log::info!("EGL ID: {:?}", egl_id);
                         encoder
