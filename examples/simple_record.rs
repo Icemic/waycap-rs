@@ -28,10 +28,10 @@ fn main() -> Result<(), WaycapError> {
 
     let mut capture = CaptureBuilder::new()
         .with_audio()
+        .with_audio_encoder(AudioEncoder::Opus)
         .with_quality_preset(QualityPreset::Medium)
         .with_cursor_shown()
         .with_video_encoder(VideoEncoder::H264Nvenc)
-        .with_audio_encoder(AudioEncoder::Opus)
         .build()?;
 
     capture.start()?;

@@ -78,9 +78,8 @@ impl CaptureBuilder {
             None => QualityPreset::Medium,
         };
 
-        let mut audio_encoder = AudioEncoder::Opus;
-        if self.include_audio {
-            audio_encoder = match self.audio_encoder {
+        let audio_encoder = if self.include_audio {
+            match self.audio_encoder {
                 Some(enc) => enc,
                 None => {
                     return Err(WaycapError::Init(
@@ -88,7 +87,9 @@ impl CaptureBuilder {
                     ))
                 }
             }
-        }
+        } else {
+            AudioEncoder::Opus
+        };
 
         Capture::new(
             video_encoder,

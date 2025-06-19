@@ -49,6 +49,7 @@
 //! }
 //! ```
 
+#![warn(clippy::all)]
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -62,6 +63,7 @@ use encoders::{
     audio::AudioEncoder, nvenc_encoder::NvencEncoder, opus_encoder::OpusEncoder,
     vaapi_encoder::VaapiEncoder, video::VideoEncoder,
 };
+use khronos_egl::Image;
 use portal_screencast_waycap::{CursorMode, ScreenCast, SourceType};
 use ringbuf::{
     traits::{Consumer, Split},
@@ -73,11 +75,15 @@ use types::{
     error::{Result, WaycapError},
     video_frame::{EncodedVideoFrame, RawVideoFrame},
 };
+use utils::{calculate_dimensions, extract_dmabuf_planes};
+use waycap_egl::EglContext;
 
 mod capture;
 mod encoders;
 pub mod pipeline;
 pub mod types;
+mod utils;
+mod waycap_egl;
 
 /// Main capture instance for recording screen content and audio.
 ///
@@ -158,13 +164,13 @@ impl Capture {
         let stream = active_cast.streams().next().unwrap();
         let stream_node = stream.pipewire_node();
 
-        let use_ram_copy = match video_encoder_type {
+        let use_nvenc_modifiers = match video_encoder_type {
             VideoEncoderType::H264Nvenc => true,
             VideoEncoderType::H264Vaapi => false,
         };
 
         let pw_video_capure = std::thread::spawn(move || {
-            let video_cap = VideoCapture::new(video_ready_pw, audio_ready_pw, use_ram_copy);
+            let video_cap = VideoCapture::new(video_ready_pw, audio_ready_pw, use_nvenc_modifiers);
             video_cap
                 .run(
                     fd,
@@ -198,9 +204,14 @@ impl Capture {
 
         join_handles.push(pw_video_capure);
 
+        let egl_context = EglContext::new(width as i32, height as i32).unwrap();
+
         let video_encoder: Arc<Mutex<dyn VideoEncoder + Send>> = match video_encoder_type {
             VideoEncoderType::H264Nvenc => {
-                Arc::new(Mutex::new(NvencEncoder::new(width, height, quality)?))
+                let mut encoder = NvencEncoder::new(width, height, quality)?;
+                encoder.init_gl(egl_context.get_texture_id())?;
+
+                Arc::new(Mutex::new(encoder))
             }
             VideoEncoderType::H264Vaapi => {
                 Arc::new(Mutex::new(VaapiEncoder::new(width, height, quality)?))
@@ -252,7 +263,9 @@ impl Capture {
             Arc::clone(&stop),
             Arc::clone(&pause),
             target_fps,
+            egl_context,
         );
+
         join_handles.push(video_worker);
 
         // Wait till both threads are ready
@@ -414,9 +427,28 @@ fn video_processor(
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
     target_fps: u64,
+    egl_context: EglContext,
 ) -> std::thread::JoinHandle<()> {
+    egl_context.release_current().unwrap();
     std::thread::spawn(move || {
+        let is_nvenc = encoder.lock().unwrap().as_any().is::<NvencEncoder>();
+
+        if is_nvenc {
+            // CUDA contexts are thread local so make it current to this one
+            encoder
+                .lock()
+                .unwrap()
+                .as_any()
+                .downcast_ref::<NvencEncoder>()
+                .unwrap()
+                .make_current()
+                .unwrap();
+        }
+
+        egl_context.make_current().unwrap();
+
         let mut last_timestamp: u64 = 0;
+
         loop {
             if stop.load(Ordering::Acquire) {
                 break;
@@ -426,6 +458,7 @@ fn video_processor(
                 std::thread::sleep(Duration::from_nanos(100));
                 continue;
             }
+
             while let Some(raw_frame) = video_recv.try_pop() {
                 let current_time = raw_frame.timestamp as u64;
 
@@ -433,8 +466,19 @@ fn video_processor(
                     continue;
                 }
 
+                if is_nvenc {
+                    match process_dmabuf_frame(&egl_context, &raw_frame) {
+                        Ok(img) => {
+                            encoder.lock().unwrap().process(&raw_frame).unwrap();
+                            egl_context.destroy_image(img).unwrap();
+                        }
+                        Err(e) => log::error!("Could not process dma buf frame: {:?}", e),
+                    }
+                } else {
+                    encoder.lock().unwrap().process(&raw_frame).unwrap();
+                }
+
                 last_timestamp = current_time;
-                encoder.lock().unwrap().process(&raw_frame).unwrap();
             }
 
             std::thread::sleep(Duration::from_nanos(100));
@@ -464,4 +508,20 @@ fn audio_processor(
 
         std::thread::sleep(Duration::from_nanos(100));
     })
+}
+
+fn process_dmabuf_frame(egl_ctx: &EglContext, raw_frame: &RawVideoFrame) -> Result<Image> {
+    let dma_buf_planes = extract_dmabuf_planes(raw_frame)?;
+
+    let format = drm_fourcc::DrmFourcc::Argb8888 as u32;
+    let (width, height) = calculate_dimensions(raw_frame)?;
+    let modifier = raw_frame.modifier;
+
+    let egl_image = egl_ctx
+        .create_image_from_dmabuf(&dma_buf_planes, format, width, height, modifier)
+        .unwrap();
+
+    egl_ctx.update_texture_from_image(egl_image).unwrap();
+
+    Ok(egl_image)
 }
