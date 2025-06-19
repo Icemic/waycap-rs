@@ -98,7 +98,6 @@ fn save_buffer(
 
     for (_, frame) in video_buffer {
         let mut packet = ffmpeg_next::codec::packet::Packet::copy(&frame.data);
-        log::info!("Data: {:?}", frame.data);
         packet.set_pts(Some(frame.pts));
         packet.set_dts(Some(frame.dts));
 

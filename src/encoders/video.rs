@@ -21,7 +21,7 @@ pub trait VideoEncoder: Send {
     fn drop_encoder(&mut self);
     fn get_encoder(&self) -> &Option<ffmpeg::codec::encoder::Video>;
     fn take_encoded_recv(&mut self) -> Option<HeapCons<EncodedVideoFrame>>;
-    fn process_egl_texture(&mut self, id: u32, capture_time: i64) -> Result<()>;
+    fn process_egl_texture(&mut self, capture_time: i64) -> Result<()>;
 
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;

@@ -60,7 +60,7 @@ impl VideoEncoder for VaapiEncoder {
         })
     }
 
-    fn process_egl_texture(&mut self, id: u32, capture_timestamp: i64) -> Result<()> {
+    fn process_egl_texture(&mut self, capture_timestamp: i64) -> Result<()> {
         log::error!("Not implemented for vaapi");
         Ok(())
     }

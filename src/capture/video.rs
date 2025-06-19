@@ -1,7 +1,7 @@
 use std::{
     os::fd::{FromRawFd, OwnedFd, RawFd},
     sync::{atomic::AtomicBool, mpsc, Arc},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use pipewire::{

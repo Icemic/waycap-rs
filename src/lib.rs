@@ -62,8 +62,6 @@ use encoders::{
     audio::AudioEncoder, nvenc_encoder::NvencEncoder, opus_encoder::OpusEncoder,
     vaapi_encoder::VaapiEncoder, video::VideoEncoder,
 };
-use khronos_egl::Downcast;
-use pipewire::sys::_IO_wide_data;
 use portal_screencast_waycap::{CursorMode, ScreenCast, SourceType};
 use ringbuf::{
     traits::{Consumer, Split},
@@ -204,9 +202,14 @@ impl Capture {
 
         join_handles.push(pw_video_capure);
 
+        let egl_context = EglContext::new(width as i32, height as i32).unwrap();
+
         let video_encoder: Arc<Mutex<dyn VideoEncoder + Send>> = match video_encoder_type {
             VideoEncoderType::H264Nvenc => {
-                Arc::new(Mutex::new(NvencEncoder::new(width, height, quality)?))
+                let mut encoder = NvencEncoder::new(width, height, quality)?;
+                encoder.init_gl(egl_context.get_texture_id())?;
+
+                Arc::new(Mutex::new(encoder))
             }
             VideoEncoderType::H264Vaapi => {
                 Arc::new(Mutex::new(VaapiEncoder::new(width, height, quality)?))
@@ -258,8 +261,7 @@ impl Capture {
             Arc::clone(&stop),
             Arc::clone(&pause),
             target_fps,
-            width,
-            height,
+            egl_context,
         );
 
         join_handles.push(video_worker);
@@ -423,25 +425,25 @@ fn video_processor(
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
     target_fps: u64,
-    width: u32,
-    height: u32,
+    egl_context: EglContext,
 ) -> std::thread::JoinHandle<()> {
+    egl_context.release_current().unwrap();
     std::thread::spawn(move || {
         let is_nvenc = encoder.lock().unwrap().as_any().is::<NvencEncoder>();
 
-        let egl_context = EglContext::new(width as i32, height as i32).unwrap();
-        egl_context.make_current().unwrap();
-
         if is_nvenc {
+            // CUDA contexts are thread local
             encoder
                 .lock()
                 .unwrap()
-                .as_any_mut()
-                .downcast_mut::<NvencEncoder>()
+                .as_any()
+                .downcast_ref::<NvencEncoder>()
                 .unwrap()
-                .initialize_encoder()
+                .make_current()
                 .unwrap();
         }
+
+        egl_context.make_current().unwrap();
 
         let mut last_timestamp: u64 = 0;
 
@@ -463,12 +465,11 @@ fn video_processor(
                 }
 
                 match process_dmabuf_frame(&egl_context, &raw_frame) {
-                    Ok(egl_id) => {
-                        log::info!("EGL ID: {:?}", egl_id);
+                    Ok(()) => {
                         encoder
                             .lock()
                             .unwrap()
-                            .process_egl_texture(egl_id, raw_frame.timestamp)
+                            .process_egl_texture(raw_frame.timestamp)
                             .unwrap();
                         last_timestamp = current_time;
                     }
@@ -509,8 +510,7 @@ fn audio_processor(
     })
 }
 
-fn process_dmabuf_frame(egl_ctx: &EglContext, raw_frame: &RawVideoFrame) -> Result<u32> {
-    log::info!("Processing new frame");
+fn process_dmabuf_frame(egl_ctx: &EglContext, raw_frame: &RawVideoFrame) -> Result<()> {
     let dma_buf_planes = extract_dmabuf_planes(raw_frame)?;
 
     let format = drm_fourcc::DrmFourcc::Argb8888 as u32;
@@ -521,19 +521,7 @@ fn process_dmabuf_frame(egl_ctx: &EglContext, raw_frame: &RawVideoFrame) -> Resu
         .create_image_from_dmabuf(&dma_buf_planes, format, width, height, modifier)
         .unwrap();
 
-    let gl_texture_id = egl_ctx.bind_image_to_texture(egl_image).unwrap();
+    egl_ctx.update_texture_from_image(egl_image).unwrap();
 
-    // let pixels = egl_ctx
-    //     .extract_pixels_from_egl_image(&egl_image, width, height)
-    //     .unwrap();
-
-    // EglContext::save_pixels_as_png(
-    //     &pixels,
-    //     width,
-    //     height,
-    //     &format!("Image-{}.png", gl_texture_id).to_string(),
-    // )
-    // .unwrap();
-
-    Ok(gl_texture_id)
+    Ok(())
 }

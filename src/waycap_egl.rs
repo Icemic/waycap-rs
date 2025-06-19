@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::ffi::{c_void, CStr};
 
 use khronos_egl::{self as egl, ClientBuffer, Dynamic, Instance};
 
@@ -10,6 +10,23 @@ type PFNGLEGLIMAGETARGETTEXTURE2DOESPROC =
 unsafe impl Sync for EglContext {}
 unsafe impl Send for EglContext {}
 
+#[derive(Clone, Copy)]
+pub enum GpuVendor {
+    NVIDIA,
+    AMD,
+    UNKNOWN,
+}
+
+impl From<&CStr> for GpuVendor {
+    fn from(value: &CStr) -> Self {
+        match value.to_str() {
+            Ok(s) if s.eq_ignore_ascii_case("nvidia") => Self::NVIDIA,
+            Ok(s) if s.eq_ignore_ascii_case("amd") => Self::AMD,
+            _ => Self::UNKNOWN,
+        }
+    }
+}
+
 pub struct EglContext {
     egl_instance: Instance<Dynamic<libloading::Library, egl::EGL1_5>>,
     display: egl::Display,
@@ -18,6 +35,8 @@ pub struct EglContext {
     _config: egl::Config,
     dmabuf_supported: bool,
     dmabuf_modifiers_supported: bool,
+    persistent_texture_id: u32,
+    gpu_vendor: GpuVendor,
 
     // Keep Wayland display alive
     _wayland_display: wayland_client::Display,
@@ -36,16 +55,18 @@ impl EglContext {
         let display =
             unsafe { egl_instance.get_display(wayland_display.c_ptr() as *mut std::ffi::c_void) }
                 .unwrap();
+
         egl_instance.initialize(display)?;
 
         let attributes = [
             egl::BUFFER_SIZE,
             24,
             egl::RENDERABLE_TYPE,
-            egl::OPENGL_BIT,
+            egl::OPENGL_ES_BIT,
             egl::NONE,
             egl::NONE,
         ];
+
         let config = egl_instance
             .choose_first_config(display, &attributes)?
             .expect("unable to find an appropriate ELG configuration");
@@ -66,7 +87,12 @@ impl EglContext {
         let (dmabuf_supported, dmabuf_modifiers_supported) =
             Self::check_dmabuf_support(&egl_instance, display).unwrap();
 
-        log::info!("Created egl context");
+        let persistent_texture =
+            Self::create_persistent_texture(width as u32, height as u32).unwrap();
+
+        let gpu_vendor = GpuVendor::from(egl_instance.query_string(Some(display), egl::VENDOR)?);
+
+        println!("Created egl context");
 
         Ok(Self {
             egl_instance,
@@ -76,9 +102,154 @@ impl EglContext {
             surface,
             dmabuf_supported,
             dmabuf_modifiers_supported,
+            persistent_texture_id: persistent_texture,
+            gpu_vendor,
 
             _wayland_display: wayland_display,
         })
+    }
+
+    pub fn update_texture_from_image(
+        &self,
+        egl_image: egl::Image,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        unsafe {
+            // Create a temporary texture from the EGL image
+            let mut temp_texture = 0;
+            gl::GenTextures(1, &mut temp_texture);
+            gl::BindTexture(gl::TEXTURE_2D, temp_texture);
+
+            // Bind EGL image to temporary texture
+            let egl_texture_2d = {
+                let proc_name = "glEGLImageTargetTexture2DOES";
+                let proc_addr = self.egl_instance.get_proc_address(proc_name);
+
+                if proc_addr.is_none() {
+                    gl::DeleteTextures(1, &temp_texture);
+                    return Err("glEGLImageTargetTexture2DOES not available".into());
+                } else {
+                    std::mem::transmute::<_, PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(proc_addr)
+                }
+            };
+
+            egl_texture_2d(gl::TEXTURE_2D, egl_image.as_ptr());
+
+            let gl_error = gl::GetError();
+            if gl_error != gl::NO_ERROR {
+                gl::DeleteTextures(1, &temp_texture);
+                return Err(
+                    format!("Failed to bind EGL image to temp texture: 0x{:x}", gl_error).into(),
+                );
+            }
+
+            // Get dimensions from the EGL image texture
+            let mut width = 0;
+            let mut height = 0;
+            gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut width);
+            gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &mut height);
+
+            // Create framebuffer for copying
+            let mut fbo = 0;
+            gl::GenFramebuffers(1, &mut fbo);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
+
+            // Attach temporary EGL texture as source
+            gl::FramebufferTexture2D(
+                gl::FRAMEBUFFER,
+                gl::COLOR_ATTACHMENT0,
+                gl::TEXTURE_2D,
+                temp_texture,
+                0,
+            );
+
+            // Check framebuffer status
+            let status = gl::CheckFramebufferStatus(gl::FRAMEBUFFER);
+            if status != gl::FRAMEBUFFER_COMPLETE {
+                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+                gl::DeleteFramebuffers(1, &fbo);
+                gl::DeleteTextures(1, &temp_texture);
+                return Err(format!("Framebuffer not complete: 0x{:x}", status).into());
+            }
+
+            // Bind persistent texture as destination
+            gl::BindTexture(gl::TEXTURE_2D, self.persistent_texture_id);
+
+            // Use CopyTexSubImage2D instead of CopyTexImage2D
+            // This updates existing texture data rather than reallocating
+            gl::CopyTexSubImage2D(
+                gl::TEXTURE_2D,
+                0, // mipmap level
+                0,
+                0, // destination x, y offset in texture
+                0,
+                0,      // source x, y offset in framebuffer
+                width,  // width to copy
+                height, // height to copy
+            );
+
+            let gl_error = gl::GetError();
+            if gl_error != gl::NO_ERROR {
+                gl::BindTexture(gl::TEXTURE_2D, 0);
+                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+                gl::DeleteFramebuffers(1, &fbo);
+                gl::DeleteTextures(1, &temp_texture);
+                return Err(format!("Failed to copy texture data: 0x{:x}", gl_error).into());
+            }
+
+            // Cleanup
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+            gl::DeleteFramebuffers(1, &fbo);
+            gl::DeleteTextures(1, &temp_texture);
+
+            Ok(())
+        }
+    }
+
+    pub fn create_persistent_texture(
+        width: u32,
+        height: u32,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
+        unsafe {
+            let mut texture_id = 0;
+            gl::GenTextures(1, &mut texture_id);
+            gl::BindTexture(gl::TEXTURE_2D, texture_id);
+
+            // Allocate texture storage with CUDA-compatible RGBA8 format
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA8 as i32, // CUDA-compatible format
+                width as i32,
+                height as i32,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                std::ptr::null(), // No initial data
+            );
+
+            // Set texture parameters for better performance
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::CLAMP_TO_EDGE as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::CLAMP_TO_EDGE as i32);
+
+            gl::BindTexture(gl::TEXTURE_2D, 0);
+
+            let gl_error = gl::GetError();
+            if gl_error != gl::NO_ERROR {
+                gl::DeleteTextures(1, &texture_id);
+                return Err(
+                    format!("Failed to create persistent texture: 0x{:x}", gl_error).into(),
+                );
+            }
+
+            println!(
+                "✓ Created persistent texture: ID {} ({}x{})",
+                texture_id, width, height
+            );
+            Ok(texture_id)
+        }
     }
 
     fn check_dmabuf_support(
@@ -211,115 +382,6 @@ impl EglContext {
         Ok(image)
     }
 
-    pub fn extract_pixels_from_egl_image(
-        &self,
-        image: &egl::Image,
-        width: u32,
-        height: u32,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        unsafe {
-            // Create framebuffer and texture
-            let mut fbo = 0;
-            let mut texture = 0;
-
-            gl::GenFramebuffers(1, &mut fbo);
-            gl::GenTextures(1, &mut texture);
-
-            // Bind texture and import EGL image
-            gl::BindTexture(gl::TEXTURE_2D, texture);
-            let egl_texture_2d = {
-                let proc_name = "glEGLImageTargetTexture2DOES";
-                let proc_addr = self.egl_instance.get_proc_address(proc_name);
-
-                if proc_addr.is_none() {
-                    None
-                } else {
-                    Some(std::mem::transmute::<_, PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(proc_addr))
-                }
-            };
-
-            egl_texture_2d.unwrap()(gl::TEXTURE_2D, image.as_ptr());
-
-            // Check for GL errors after importing
-            let gl_error = gl::GetError();
-            if gl_error != gl::NO_ERROR {
-                gl::DeleteFramebuffers(1, &fbo);
-                gl::DeleteTextures(1, &texture);
-                return Err(
-                    format!("Failed to import EGL image to texture: 0x{:x}", gl_error).into(),
-                );
-            }
-
-            // Set up framebuffer
-            gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
-            gl::FramebufferTexture2D(
-                gl::FRAMEBUFFER,
-                gl::COLOR_ATTACHMENT0,
-                gl::TEXTURE_2D,
-                texture,
-                0,
-            );
-
-            // Check framebuffer status
-            let status = gl::CheckFramebufferStatus(gl::FRAMEBUFFER);
-            if status != gl::FRAMEBUFFER_COMPLETE {
-                gl::DeleteFramebuffers(1, &fbo);
-                gl::DeleteTextures(1, &texture);
-                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-                return Err(format!("Framebuffer not complete: 0x{:x}", status).into());
-            }
-
-            // Set viewport
-            gl::Viewport(0, 0, width as i32, height as i32);
-
-            // Allocate pixel buffer (RGBA format)
-            let pixel_count = (width * height * 4) as usize;
-            let mut pixels = vec![0u8; pixel_count];
-
-            // Read pixels from framebuffer
-            gl::ReadPixels(
-                0,
-                0,                 // x, y offset
-                width as i32,      // width
-                height as i32,     // height
-                gl::RGBA,          // format
-                gl::UNSIGNED_BYTE, // type
-                pixels.as_mut_ptr() as *mut std::ffi::c_void,
-            );
-
-            // Check for read errors
-            let gl_error = gl::GetError();
-            if gl_error != gl::NO_ERROR {
-                gl::DeleteFramebuffers(1, &fbo);
-                gl::DeleteTextures(1, &texture);
-                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-                return Err(format!("Failed to read pixels: 0x{:x}", gl_error).into());
-            }
-
-            // Cleanup
-            gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-            gl::DeleteFramebuffers(1, &fbo);
-            gl::DeleteTextures(1, &texture);
-
-            Ok(pixels)
-        }
-    }
-
-    pub fn save_pixels_as_png(
-        pixels: &[u8],
-        width: u32,
-        height: u32,
-        filename: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        use image::{ImageBuffer, RgbaImage};
-
-        let img: RgbaImage = ImageBuffer::from_raw(width, height, pixels.to_vec())
-            .ok_or("Failed to create image buffer")?;
-
-        img.save(filename)?;
-        Ok(())
-    }
-
     pub fn bind_image_to_texture(
         &self,
         image: egl::Image,
@@ -358,13 +420,13 @@ impl EglContext {
                 &mut internal_format,
             );
 
-            log::info!(
+            println!(
                 "EGL image created texture with format: 0x{:x}",
                 internal_format
             );
 
             if internal_format == gl::RGBA as i32 {
-                log::info!("Converting unsized RGBA to RGBA8 for CUDA compatibility");
+                println!("Converting unsized RGBA to RGBA8 for CUDA compatibility");
 
                 // Create a new texture with proper format
                 let mut cuda_compatible_texture = 0;
@@ -428,7 +490,7 @@ impl EglContext {
                 // Return the CUDA-compatible texture
                 gl::BindTexture(gl::TEXTURE_2D, 0);
 
-                log::info!(
+                println!(
                     "✓ Created CUDA-compatible texture: ID {}",
                     cuda_compatible_texture
                 );
@@ -439,30 +501,14 @@ impl EglContext {
                 let mut width = 0;
                 gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut width);
                 if width == 0 {
-                    log::warn!("Texture has zero width after bind");
+                    println!("Texture has zero width after bind");
                 }
 
                 gl::BindTexture(gl::TEXTURE_2D, 0);
 
-                log::info!("✓ Bound EGL image to GL_TEXTURE_2D: {}", texture_id);
+                println!("✓ Bound EGL image to GL_TEXTURE_2D: {}", texture_id);
                 return Ok(texture_id);
             }
-
-            // Fallback to GL_TEXTURE_EXTERNAL_OES
-            // TEXTURE_EXTERNAL_OES
-            gl::BindTexture(0x8D65, texture_id);
-            egl_texture_2d.unwrap()(0x8D65, image.as_ptr());
-            gl::BindTexture(0x8D65, 0);
-
-            if gl::GetError() != gl::NO_ERROR {
-                gl::DeleteTextures(1, &texture_id);
-                return Err("Failed to bind EGL image to texture".into());
-            }
-
-            log::info!(
-                "✓ Bound EGL image to GL_TEXTURE_EXTERNAL_OES: {}",
-                texture_id
-            );
         }
 
         Ok(texture_id)
@@ -504,44 +550,12 @@ impl EglContext {
         self.display
     }
 
-    pub fn test_opengl(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let version = unsafe {
-            let data = gl::GetString(gl::VERSION) as *const i8;
-            if data.is_null() {
-                "Unknown".to_string()
-            } else {
-                std::ffi::CStr::from_ptr(data)
-                    .to_string_lossy()
-                    .into_owned()
-            }
-        };
-        log::info!("OpenGL Version: {}", version);
+    pub fn get_texture_id(&self) -> u32 {
+        self.persistent_texture_id
+    }
 
-        let renderer = unsafe {
-            let data = gl::GetString(gl::RENDERER) as *const i8;
-            if data.is_null() {
-                "Unknown".to_string()
-            } else {
-                std::ffi::CStr::from_ptr(data)
-                    .to_string_lossy()
-                    .into_owned()
-            }
-        };
-        log::info!("OpenGL Renderer: {}", renderer);
-
-        // Test texture creation
-        let mut texture_id = 0;
-        unsafe {
-            gl::GenTextures(1, &mut texture_id);
-            if texture_id != 0 {
-                println!("✓ Texture created: ID {}", texture_id);
-                gl::DeleteTextures(1, &texture_id);
-            } else {
-                return Err("Failed to create texture".into());
-            }
-        }
-
-        Ok(())
+    pub fn get_gpu_vendor(&self) -> GpuVendor {
+        self.gpu_vendor
     }
 }
 
