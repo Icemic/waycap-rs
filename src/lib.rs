@@ -49,6 +49,7 @@
 //! }
 //! ```
 
+#![warn(clippy::all)]
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -62,6 +63,7 @@ use encoders::{
     audio::AudioEncoder, nvenc_encoder::NvencEncoder, opus_encoder::OpusEncoder,
     vaapi_encoder::VaapiEncoder, video::VideoEncoder,
 };
+use khronos_egl::Image;
 use portal_screencast_waycap::{CursorMode, ScreenCast, SourceType};
 use ringbuf::{
     traits::{Consumer, Split},
@@ -432,7 +434,7 @@ fn video_processor(
         let is_nvenc = encoder.lock().unwrap().as_any().is::<NvencEncoder>();
 
         if is_nvenc {
-            // CUDA contexts are thread local
+            // CUDA contexts are thread local so make it current to this one
             encoder
                 .lock()
                 .unwrap()
@@ -464,21 +466,19 @@ fn video_processor(
                     continue;
                 }
 
-                match process_dmabuf_frame(&egl_context, &raw_frame) {
-                    Ok(()) => {
-                        encoder
-                            .lock()
-                            .unwrap()
-                            .process_egl_texture(raw_frame.timestamp)
-                            .unwrap();
-                        last_timestamp = current_time;
+                if is_nvenc {
+                    match process_dmabuf_frame(&egl_context, &raw_frame) {
+                        Ok(img) => {
+                            encoder.lock().unwrap().process(&raw_frame).unwrap();
+                            egl_context.destroy_image(img).unwrap();
+                        }
+                        Err(e) => log::error!("Could not process dma buf frame: {:?}", e),
                     }
-                    Err(_) => {
-                        log::info!("Falling back to sw encoding");
-                        encoder.lock().unwrap().process(&raw_frame).unwrap();
-                        last_timestamp = current_time;
-                    }
+                } else {
+                    encoder.lock().unwrap().process(&raw_frame).unwrap();
                 }
+
+                last_timestamp = current_time;
             }
 
             std::thread::sleep(Duration::from_nanos(100));
@@ -510,7 +510,7 @@ fn audio_processor(
     })
 }
 
-fn process_dmabuf_frame(egl_ctx: &EglContext, raw_frame: &RawVideoFrame) -> Result<()> {
+fn process_dmabuf_frame(egl_ctx: &EglContext, raw_frame: &RawVideoFrame) -> Result<Image> {
     let dma_buf_planes = extract_dmabuf_planes(raw_frame)?;
 
     let format = drm_fourcc::DrmFourcc::Argb8888 as u32;
@@ -523,5 +523,5 @@ fn process_dmabuf_frame(egl_ctx: &EglContext, raw_frame: &RawVideoFrame) -> Resu
 
     egl_ctx.update_texture_from_image(egl_image).unwrap();
 
-    Ok(())
+    Ok(egl_image)
 }

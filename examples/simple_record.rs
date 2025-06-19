@@ -70,10 +70,10 @@ fn main() -> Result<(), WaycapError> {
         }
 
         while let Some(encoded_frame) = audio_recv.try_pop() {
-            // log::info!("======= NEW AUDIO FRAME =======");
-            // log::info!("PTS: {:?}", encoded_frame.pts);
-            // log::info!("Capture Time Stamp: {:?}", encoded_frame.timestamp);
-            // log::info!("===============================");
+            log::info!("======= NEW AUDIO FRAME =======");
+            log::info!("PTS: {:?}", encoded_frame.pts);
+            log::info!("Capture Time Stamp: {:?}", encoded_frame.timestamp);
+            log::info!("===============================");
         }
 
         std::thread::sleep(Duration::from_nanos(100));

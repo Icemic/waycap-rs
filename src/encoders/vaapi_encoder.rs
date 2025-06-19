@@ -1,7 +1,4 @@
-use std::{
-    any::Any,
-    ptr::{null, null_mut},
-};
+use std::{any::Any, ptr::null_mut};
 
 use drm_fourcc::DrmFourcc;
 use ffmpeg_next::{
@@ -60,16 +57,7 @@ impl VideoEncoder for VaapiEncoder {
         })
     }
 
-    fn process_egl_texture(&mut self, capture_timestamp: i64) -> Result<()> {
-        log::error!("Not implemented for vaapi");
-        Ok(())
-    }
-
     fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 

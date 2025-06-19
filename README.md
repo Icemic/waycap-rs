@@ -4,9 +4,9 @@ A high-level Wayland screen capture library with hardware-accelerated encoding f
 
 ## Features
 
-- **Hardware-accelerated video encoding** (Using VAAPI or NVenc)
+- **Hardware-accelerated video encoding** (Using VAAPI or NVENC)
 - **Audio capture** with Opus encoding
-- **Copy-Free** video encoding leveraging pipewire's DMA Buffers (For Vaapi only right now)
+- **Copy-Free** video encoding leveraging pipewire's DMA Buffers
 - **Multiple quality presets** for various use cases
 - **Cursor visibility control**
 - **Simple, ergonomic API** for easy integration
@@ -17,6 +17,7 @@ A high-level Wayland screen capture library with hardware-accelerated encoding f
 - XDG Desktop Portal
 - PipeWire
 - VA-API compatible hardware for VAAPI encoding
+- CUDA compatible hardware for NVENC encoding
 
 ## Installation
 
@@ -24,7 +25,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-waycap-rs = "0.1.0"
+waycap-rs = "0.2.0"
 ```
 
 ## Examples Usage
@@ -89,7 +90,6 @@ https://github.com/Adonca2203/WayCap
 Contributions are always welcome and encouraged, feel free to open a PR with any features you think may be missing.
 
 ### Currently I have planned adding the following:
-- **H264Nvenc** for more native NVIDIA hardware support.
 - Capturing more than system audio -- Support for microphones
 
 ### Areas for Improvement aside from the things already mentioned:
@@ -97,6 +97,7 @@ Contributions are always welcome and encouraged, feel free to open a PR with any
 - Documentation around the public facing APIs.
 - Bug Reports via github Issues
 - Platform Testing as I am currently limited by my hardware
+- Leverage the GpuVendor field of EGL to dynamically set the target encoder
 
 ## Pull Request Guidelines
 - **Fork the repository** based off the `main` branch.

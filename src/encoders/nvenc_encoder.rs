@@ -42,6 +42,7 @@ pub struct NvencEncoder {
     quality: QualityPreset,
     encoded_frame_recv: Option<HeapCons<EncodedVideoFrame>>,
     encoded_frame_sender: Option<HeapProd<EncodedVideoFrame>>,
+
     cuda_ctx: Context,
     graphics_resource: CUgraphicsResource,
     egl_texture: u32,
@@ -80,11 +81,7 @@ impl VideoEncoder for NvencEncoder {
         self
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn process_egl_texture(&mut self, capture_time: i64) -> Result<()> {
+    fn process(&mut self, frame: &RawVideoFrame) -> Result<()> {
         if let Some(ref mut encoder) = self.encoder {
             let mut cuda_frame = ffmpeg::util::frame::Video::new(
                 ffmpeg_next::format::Pixel::CUDA,
@@ -175,50 +172,9 @@ impl VideoEncoder for NvencEncoder {
                 gl::BindTexture(gl::TEXTURE_2D, 0);
             }
 
-            cuda_frame.set_pts(Some(capture_time));
+            cuda_frame.set_pts(Some(frame.timestamp));
             encoder.send_frame(&cuda_frame)?;
 
-            let mut packet = ffmpeg::codec::packet::Packet::empty();
-            if encoder.receive_packet(&mut packet).is_ok() {
-                if let Some(data) = packet.data() {
-                    if let Some(ref mut sender) = self.encoded_frame_sender {
-                        if sender
-                            .try_push(EncodedVideoFrame {
-                                data: data.to_vec(),
-                                is_keyframe: packet.is_key(),
-                                pts: packet.pts().unwrap_or(0),
-                                dts: packet.dts().unwrap_or(0),
-                            })
-                            .is_err()
-                        {
-                            log::error!("Could not send encoded packet to the ringbuf");
-                        }
-                    }
-                };
-            }
-        }
-
-        Ok(())
-    }
-
-    fn process(&mut self, frame: &RawVideoFrame) -> Result<()> {
-        if let Some(ref mut encoder) = self.encoder {
-            if let Some(fd) = frame.dmabuf_fd {
-                log::info!("Received dma frame: {:?}", frame);
-            } else {
-                let mut src_frame = ffmpeg::util::frame::video::Video::new(
-                    ffmpeg_next::format::Pixel::BGRA,
-                    encoder.width(),
-                    encoder.height(),
-                );
-
-                src_frame.set_pts(Some(frame.timestamp));
-                src_frame.data_mut(0).copy_from_slice(&frame.data);
-
-                encoder.send_frame(&src_frame).unwrap();
-            }
-
-            // Retrieve and handle the encoded packet
             let mut packet = ffmpeg::codec::packet::Packet::empty();
             if encoder.receive_packet(&mut packet).is_ok() {
                 if let Some(data) = packet.data() {
@@ -465,5 +421,10 @@ impl Drop for NvencEncoder {
             log::error!("Error while draining nvenc encoder during drop: {:?}", e);
         }
         self.drop_encoder();
+
+        let result = unsafe { cuGraphicsUnregisterResource(self.graphics_resource) };
+        if result != CUresult::CUDA_SUCCESS {
+            log::error!("Error cleaning up graphics resource: {:?}", result);
+        }
     }
 }

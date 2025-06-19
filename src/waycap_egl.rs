@@ -11,6 +11,7 @@ unsafe impl Sync for EglContext {}
 unsafe impl Send for EglContext {}
 
 #[derive(Clone, Copy)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum GpuVendor {
     NVIDIA,
     AMD,
@@ -36,6 +37,7 @@ pub struct EglContext {
     dmabuf_supported: bool,
     dmabuf_modifiers_supported: bool,
     persistent_texture_id: u32,
+    #[allow(dead_code)]
     gpu_vendor: GpuVendor,
 
     // Keep Wayland display alive
@@ -82,7 +84,7 @@ impl EglContext {
         let surface = egl_instance.create_pbuffer_surface(display, config, &surface_attributes)?;
         egl_instance.make_current(display, Some(surface), Some(surface), Some(context))?;
 
-        gl::load_with(|symbol| egl_instance.get_proc_address(&symbol).unwrap() as *const _);
+        gl::load_with(|symbol| egl_instance.get_proc_address(symbol).unwrap() as *const _);
 
         let (dmabuf_supported, dmabuf_modifiers_supported) =
             Self::check_dmabuf_support(&egl_instance, display).unwrap();
@@ -91,8 +93,6 @@ impl EglContext {
             Self::create_persistent_texture(width as u32, height as u32).unwrap();
 
         let gpu_vendor = GpuVendor::from(egl_instance.query_string(Some(display), egl::VENDOR)?);
-
-        println!("Created egl context");
 
         Ok(Self {
             egl_instance,
@@ -128,7 +128,7 @@ impl EglContext {
                     gl::DeleteTextures(1, &temp_texture);
                     return Err("glEGLImageTargetTexture2DOES not available".into());
                 } else {
-                    std::mem::transmute::<_, PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(proc_addr)
+                    std::mem::transmute::<Option<extern "system" fn()>, PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(proc_addr)
                 }
             };
 
@@ -244,9 +244,11 @@ impl EglContext {
                 );
             }
 
-            println!(
+            log::trace!(
                 "✓ Created persistent texture: ID {} ({}x{})",
-                texture_id, width, height
+                texture_id,
+                width,
+                height
             );
             Ok(texture_id)
         }
@@ -382,138 +384,6 @@ impl EglContext {
         Ok(image)
     }
 
-    pub fn bind_image_to_texture(
-        &self,
-        image: egl::Image,
-    ) -> Result<u32, Box<dyn std::error::Error>> {
-        let mut texture_id = 0;
-        unsafe {
-            gl::GenTextures(1, &mut texture_id);
-
-            // Try GL_TEXTURE_2D first
-            gl::BindTexture(gl::TEXTURE_2D, texture_id);
-
-            // Load the extension function
-
-            let egl_texture_2d = {
-                let proc_name = "glEGLImageTargetTexture2DOES";
-                let proc_addr = self.egl_instance.get_proc_address(proc_name);
-
-                if proc_addr.is_none() {
-                    None
-                } else {
-                    Some(std::mem::transmute::<_, PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(proc_addr))
-                }
-            };
-
-            egl_texture_2d.unwrap()(gl::TEXTURE_2D, image.as_ptr());
-
-            let mut width = 0;
-            let mut height = 0;
-            let mut internal_format = 0;
-            gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut width);
-            gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_HEIGHT, &mut height);
-            gl::GetTexLevelParameteriv(
-                gl::TEXTURE_2D,
-                0,
-                gl::TEXTURE_INTERNAL_FORMAT,
-                &mut internal_format,
-            );
-
-            println!(
-                "EGL image created texture with format: 0x{:x}",
-                internal_format
-            );
-
-            if internal_format == gl::RGBA as i32 {
-                println!("Converting unsized RGBA to RGBA8 for CUDA compatibility");
-
-                // Create a new texture with proper format
-                let mut cuda_compatible_texture = 0;
-                gl::GenTextures(1, &mut cuda_compatible_texture);
-                gl::BindTexture(gl::TEXTURE_2D, cuda_compatible_texture);
-
-                // Allocate with RGBA8 format
-                gl::TexImage2D(
-                    gl::TEXTURE_2D,
-                    0,
-                    gl::RGBA8 as i32, // CUDA-compatible format
-                    width as i32,
-                    height as i32,
-                    0,
-                    gl::RGBA,
-                    gl::UNSIGNED_BYTE,
-                    std::ptr::null(),
-                );
-
-                // Copy from EGL texture to CUDA-compatible texture using FBO
-                let mut fbo = 0;
-                gl::GenFramebuffers(1, &mut fbo);
-                gl::BindFramebuffer(gl::FRAMEBUFFER, fbo);
-
-                // Attach EGL texture as source
-                gl::FramebufferTexture2D(
-                    gl::FRAMEBUFFER,
-                    gl::COLOR_ATTACHMENT0,
-                    gl::TEXTURE_2D,
-                    texture_id, // EGL texture
-                    0,
-                );
-
-                // Check framebuffer status
-                let status = gl::CheckFramebufferStatus(gl::FRAMEBUFFER);
-                if status != gl::FRAMEBUFFER_COMPLETE {
-                    gl::DeleteFramebuffers(1, &fbo);
-                    gl::DeleteTextures(1, &cuda_compatible_texture);
-                    gl::DeleteTextures(1, &texture_id);
-                    return Err(format!("Framebuffer not complete: 0x{:x}", status).into());
-                }
-
-                // Copy to CUDA-compatible texture
-                gl::BindTexture(gl::TEXTURE_2D, cuda_compatible_texture);
-                gl::CopyTexImage2D(
-                    gl::TEXTURE_2D,
-                    0,
-                    gl::RGBA8, // CUDA-compatible format
-                    0,
-                    0, // x, y offset in framebuffer
-                    width as i32,
-                    height as i32,
-                    0, // border
-                );
-
-                // Cleanup
-                gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
-                gl::DeleteFramebuffers(1, &fbo);
-                gl::DeleteTextures(1, &texture_id); // Delete EGL texture
-
-                // Return the CUDA-compatible texture
-                gl::BindTexture(gl::TEXTURE_2D, 0);
-
-                println!(
-                    "✓ Created CUDA-compatible texture: ID {}",
-                    cuda_compatible_texture
-                );
-                return Ok(cuda_compatible_texture);
-            }
-
-            if gl::GetError() == gl::NO_ERROR {
-                let mut width = 0;
-                gl::GetTexLevelParameteriv(gl::TEXTURE_2D, 0, gl::TEXTURE_WIDTH, &mut width);
-                if width == 0 {
-                    println!("Texture has zero width after bind");
-                }
-
-                gl::BindTexture(gl::TEXTURE_2D, 0);
-
-                println!("✓ Bound EGL image to GL_TEXTURE_2D: {}", texture_id);
-                return Ok(texture_id);
-            }
-        }
-
-        Ok(texture_id)
-    }
-
     pub fn destroy_image(&self, image: egl::Image) -> Result<(), Box<dyn std::error::Error>> {
         self.egl_instance
             .destroy_image(self.display, image)
@@ -542,18 +412,13 @@ impl EglContext {
         Ok(())
     }
 
-    pub fn get_egl_instance(&self) -> &Instance<Dynamic<libloading::Library, egl::EGL1_5>> {
-        &self.egl_instance
-    }
-
-    pub fn get_display(&self) -> egl::Display {
-        self.display
-    }
-
     pub fn get_texture_id(&self) -> u32 {
         self.persistent_texture_id
     }
 
+    // TODO: We can probably leverage this to dynamically set the encoder and deprecate
+    // the need to pass it in
+    #[allow(unused)]
     pub fn get_gpu_vendor(&self) -> GpuVendor {
         self.gpu_vendor
     }
@@ -571,5 +436,6 @@ impl Drop for EglContext {
             .egl_instance
             .destroy_context(self.display, self.context);
         let _ = self.egl_instance.terminate(self.display);
+        self.delete_texture(self.persistent_texture_id);
     }
 }
