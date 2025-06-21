@@ -117,6 +117,7 @@ pub struct Capture {
     audio_encoder: Option<Arc<Mutex<dyn AudioEncoder + Send>>>,
     stop_flag: Arc<AtomicBool>,
     pause_flag: Arc<AtomicBool>,
+    egl_ctx: Arc<EglContext>,
 
     worker_handles: Vec<std::thread::JoinHandle<()>>,
 
@@ -204,7 +205,7 @@ impl Capture {
 
         join_handles.push(pw_video_capure);
 
-        let egl_context = EglContext::new(width as i32, height as i32).unwrap();
+        let egl_context = Arc::new(EglContext::new(width as i32, height as i32).unwrap());
 
         let video_encoder: Arc<Mutex<dyn VideoEncoder + Send>> = match video_encoder_type {
             VideoEncoderType::H264Nvenc => {
@@ -263,7 +264,7 @@ impl Capture {
             Arc::clone(&stop),
             Arc::clone(&pause),
             target_fps,
-            egl_context,
+            Arc::clone(&egl_context),
         );
 
         join_handles.push(video_worker);
@@ -283,6 +284,7 @@ impl Capture {
             worker_handles: join_handles,
             pw_video_terminate_tx: pw_sender,
             pw_audio_terminate_tx: Some(pw_audio_sender),
+            egl_ctx: egl_context,
         })
     }
 
@@ -418,6 +420,10 @@ impl Capture {
 impl Drop for Capture {
     fn drop(&mut self) {
         let _ = self.close();
+
+        // Make OpenGL context current to this thread before we drop nvenc which relies on it
+        let _ = self.egl_ctx.release_current();
+        let _ = self.egl_ctx.make_current();
     }
 }
 
@@ -427,7 +433,7 @@ fn video_processor(
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
     target_fps: u64,
-    egl_context: EglContext,
+    egl_context: Arc<EglContext>,
 ) -> std::thread::JoinHandle<()> {
     egl_context.release_current().unwrap();
     std::thread::spawn(move || {

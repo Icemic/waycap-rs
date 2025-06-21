@@ -388,7 +388,7 @@ impl NvencEncoder {
             );
 
             if result != CUresult::CUDA_SUCCESS {
-                return Err(WaycapError::Encoding(format!(
+                return Err(WaycapError::Init(format!(
                     "Error registering GL texture to CUDA: {:?}",
                     result
                 )));
@@ -399,7 +399,7 @@ impl NvencEncoder {
             if result != CUresult::CUDA_SUCCESS {
                 cuGraphicsUnregisterResource(self.graphics_resource);
                 gl::BindTexture(gl::TEXTURE_2D, 0);
-                return Err(WaycapError::Encoding(format!(
+                return Err(WaycapError::Init(format!(
                     "Failed to set graphics resource map flags: {:?}",
                     result
                 )));
@@ -421,6 +421,10 @@ impl Drop for NvencEncoder {
             log::error!("Error while draining nvenc encoder during drop: {:?}", e);
         }
         self.drop_encoder();
+
+        if let Err(e) = self.make_current() {
+            log::error!("Could not make context current during drop: {:?}", e);
+        }
 
         let result = unsafe { cuGraphicsUnregisterResource(self.graphics_resource) };
         if result != CUresult::CUDA_SUCCESS {
