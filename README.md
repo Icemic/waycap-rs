@@ -103,7 +103,6 @@ If you would like to contribute, the following system dependencies are needed to
 ## Installation of Dependencies example: Arch Linux
 ```bash
 sudo pacman -S \
-  dbus \
   pipewire \
   ffmpeg \
   wayland \
@@ -125,7 +124,7 @@ cargo run --example example_name
 
 Please run the examples before making a PR, to test and debug your changes.
 
-### Areas for Improvement aside from the things already mentioned:
+### Areas for Improvement:
 - Any optimizations for the library's core capture logic.
 - Documentation around the public facing APIs.
 - Bug Reports via github Issues
