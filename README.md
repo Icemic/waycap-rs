@@ -25,7 +25,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-waycap-rs = "0.2.1"
+waycap-rs = "0.2.2"
 ```
 
 ## Example Usage

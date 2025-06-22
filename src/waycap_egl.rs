@@ -73,8 +73,6 @@ impl EglContext {
             .choose_first_config(display, &attributes)?
             .expect("unable to find an appropriate ELG configuration");
 
-        egl_instance.bind_api(egl::OPENGL_ES_API)?;
-
         let context_attributes = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
 
         let context = egl_instance.create_context(display, config, None, &context_attributes)?;

@@ -315,9 +315,8 @@ impl NvencEncoder {
             hw_frame_context.format = encoder_ctx.format().into();
             hw_frame_context.device_ctx = hw_device_ctx;
             // Decides buffer size if we do not pop frame from the encoder we cannot
-            // enqueue more than these many -- maybe adjust but for now setting it to
-            // doble target fps
-            hw_frame_context.initial_pool_size = 120;
+            // keep pushing. Smaller better as we reserve less GPU memory
+            hw_frame_context.initial_pool_size = 2;
 
             let err = av_hwframe_ctx_init(frame_ctx);
             if err < 0 {
