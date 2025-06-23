@@ -1,9 +1,14 @@
 use std::{
     os::fd::{FromRawFd, OwnedFd, RawFd},
-    sync::{atomic::AtomicBool, mpsc, Arc},
+    sync::{
+        atomic::AtomicBool,
+        mpsc::{self},
+        Arc,
+    },
     time::Instant,
 };
 
+use crossbeam::channel::Sender;
 use pipewire::{
     self as pw,
     context::Context,
@@ -17,7 +22,6 @@ use pipewire::{
 };
 use pw::{properties::properties, spa};
 
-use ringbuf::{traits::Producer, HeapProd};
 use spa::pod::Pod;
 
 use crate::types::video_frame::RawVideoFrame;
@@ -72,7 +76,7 @@ impl VideoCapture {
         &self,
         pipewire_fd: RawFd,
         stream_node: u32,
-        mut ringbuf_producer: HeapProd<RawVideoFrame>,
+        frame_tx: Sender<RawVideoFrame>,
         termination_recv: pw::channel::Receiver<Terminate>,
         saving: Arc<AtomicBool>,
         start_time: Instant,
@@ -188,28 +192,34 @@ impl VideoCapture {
 
                         let time_us = start_time.elapsed().as_micros() as i64;
 
-                        // send frame data to encoder
                         let data = &mut datas[0];
 
                         let fd = Self::get_dmabuf_fd(data);
 
-                        if fd.is_some()
-                            && ringbuf_producer
-                                .try_push(RawVideoFrame {
-                                    data: Vec::new(),
-                                    timestamp: time_us,
-                                    dmabuf_fd: fd,
-                                    stride: data.chunk().stride(),
-                                    offset: data.chunk().offset(),
-                                    size: data.chunk().size(),
-                                    modifier: udata.video_format.modifier(),
-                                })
-                                .is_err()
-                        {
-                            log::error!(
-                                "Error sending video frame at: {:?}. Ring buf full?",
-                                time_us
-                            );
+                        match frame_tx.try_send(RawVideoFrame {
+                            data: data.data().unwrap_or_default().to_vec(),
+                            timestamp: time_us,
+                            dmabuf_fd: fd,
+                            stride: data.chunk().stride(),
+                            offset: data.chunk().offset(),
+                            size: data.chunk().size(),
+                            modifier: udata.video_format.modifier(),
+                        }) {
+                            Ok(_) => {}
+                            Err(crossbeam::channel::TrySendError::Full(frame)) => {
+                                log::error!(
+                                    "Could not send video frame at: {}. Channel full.",
+                                    frame.timestamp
+                                );
+                            }
+                            Err(crossbeam::channel::TrySendError::Disconnected(frame)) => {
+                                // TODO: If we disconnected, terminate the session instead of
+                                // throwing an error it means the receiver was dropped.
+                                log::error!(
+                                    "Could not send video frame at: {}. Connection closed.",
+                                    frame.timestamp
+                                );
+                            }
                         }
                     }
                 }

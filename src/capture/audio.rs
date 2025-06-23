@@ -4,6 +4,8 @@ use std::{
     time::Instant,
 };
 
+use crate::types::audio_frame::RawAudioFrame;
+use crossbeam::channel::Sender;
 use pipewire::{
     self as pw,
     context::Context,
@@ -17,9 +19,6 @@ use pipewire::{
     },
     stream::{StreamFlags, StreamState},
 };
-use ringbuf::{traits::Producer, HeapProd};
-
-use crate::types::audio_frame::RawAudioFrame;
 
 use super::Terminate;
 
@@ -43,7 +42,7 @@ impl AudioCapture {
 
     pub fn run(
         &self,
-        mut ringbuf_producer: HeapProd<RawAudioFrame>,
+        audio_sender: Sender<RawAudioFrame>,
         start_time: Instant,
         termination_recv: pw::channel::Receiver<Terminate>,
         saving: Arc<AtomicBool>,
@@ -145,14 +144,25 @@ impl AudioCapture {
                     if let Some(samples) = data.data() {
                         let samples_f32: &[f32] = bytemuck::cast_slice(samples);
                         let audio_samples = &samples_f32[..n_samples as usize];
-                        if let Err(frame) = ringbuf_producer.try_push(RawAudioFrame {
+                        match audio_sender.try_send(RawAudioFrame {
                             samples: audio_samples.to_vec(),
                             timestamp: time_us,
                         }) {
-                            log::error!(
-                                "Could not add audio frame at: {:?}. Is the buffer full?",
-                                frame.timestamp
-                            );
+                            Ok(_) => {}
+                            Err(crossbeam::channel::TrySendError::Full(frame)) => {
+                                log::error!(
+                                    "channel is full when trying to send frame at: {}.",
+                                    frame.timestamp
+                                );
+                            }
+                            Err(crossbeam::channel::TrySendError::Disconnected(frame)) => {
+                                // TODO: If we disconnected, terminate the session instead of
+                                // throwing an error it means the receiver was dropped.
+                                log::error!(
+                                    "channel is disconnected when trying to send frame at: {}.",
+                                    frame.timestamp
+                                );
+                            }
                         }
                     }
                 }

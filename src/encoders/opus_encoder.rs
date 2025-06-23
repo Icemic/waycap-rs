@@ -1,10 +1,6 @@
+use crossbeam::channel::{bounded, Receiver, Sender};
 use ffmpeg_next::{self as ffmpeg, Rational};
 use std::collections::VecDeque;
-
-use ringbuf::{
-    traits::{Producer, Split},
-    HeapCons, HeapProd, HeapRb,
-};
 
 use crate::types::audio_frame::EncodedAudioFrame;
 
@@ -14,8 +10,8 @@ pub struct OpusEncoder {
     encoder: Option<ffmpeg::codec::encoder::Audio>,
     next_pts: i64,
     leftover_data: VecDeque<f32>,
-    encoded_samples_recv: Option<HeapCons<EncodedAudioFrame>>,
-    encoded_samples_sender: Option<HeapProd<EncodedAudioFrame>>,
+    encoded_samples_recv: Option<Receiver<EncodedAudioFrame>>,
+    encoded_samples_sender: Sender<EncodedAudioFrame>,
     capture_timestamps: VecDeque<i64>,
 }
 
@@ -55,14 +51,14 @@ impl AudioEncoder for OpusEncoder {
         Self: Sized,
     {
         let encoder = Self::create_encoder()?;
-        let audio_ring_buffer = HeapRb::<EncodedAudioFrame>::new(5);
-        let (sender, receiver) = audio_ring_buffer.split();
+        let (frame_tx, frame_rx): (Sender<EncodedAudioFrame>, Receiver<EncodedAudioFrame>) =
+            bounded(10);
         Ok(Self {
             encoder: Some(encoder),
             next_pts: 0,
             leftover_data: VecDeque::with_capacity(10),
-            encoded_samples_recv: Some(receiver),
-            encoded_samples_sender: Some(sender),
+            encoded_samples_recv: Some(frame_rx),
+            encoded_samples_sender: frame_tx,
             capture_timestamps: VecDeque::with_capacity(10),
         })
     }
@@ -110,16 +106,19 @@ impl AudioEncoder for OpusEncoder {
                 if encoder.receive_packet(&mut packet).is_ok() {
                     if let Some(data) = packet.data() {
                         let pts = packet.pts().unwrap_or(0);
-                        if let Some(ref mut sender) = self.encoded_samples_sender {
-                            if sender
-                                .try_push(EncodedAudioFrame {
-                                    data: data.to_vec(),
-                                    pts,
-                                    timestamp: self.capture_timestamps.pop_front().unwrap_or(0),
-                                })
-                                .is_err()
-                            {
-                                log::error!("Could not send encoded packet to audio ringbuf");
+                        match self.encoded_samples_sender.try_send(EncodedAudioFrame {
+                            data: data.to_vec(),
+                            pts,
+                            timestamp: self.capture_timestamps.pop_front().unwrap_or(0),
+                        }) {
+                            Ok(_) => {}
+                            Err(crossbeam::channel::TrySendError::Full(_)) => {
+                                log::error!("Could not send encoded audio frame. Receiver is full");
+                            }
+                            Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                                log::error!(
+                                    "Cound not send encoded audio frame. Receiver disconnected"
+                                );
                             }
                         }
                     }
@@ -143,16 +142,19 @@ impl AudioEncoder for OpusEncoder {
             while encoder.receive_packet(&mut packet).is_ok() {
                 if let Some(data) = packet.data() {
                     let pts = packet.pts().unwrap_or(0);
-                    if let Some(ref mut sender) = self.encoded_samples_sender {
-                        if sender
-                            .try_push(EncodedAudioFrame {
-                                data: data.to_vec(),
-                                pts,
-                                timestamp: self.capture_timestamps.pop_front().unwrap_or(0),
-                            })
-                            .is_err()
-                        {
-                            log::error!("Could not send encoded packet to audio ringbuf");
+                    match self.encoded_samples_sender.try_send(EncodedAudioFrame {
+                        data: data.to_vec(),
+                        pts,
+                        timestamp: self.capture_timestamps.pop_front().unwrap_or(0),
+                    }) {
+                        Ok(_) => {}
+                        Err(crossbeam::channel::TrySendError::Full(_)) => {
+                            log::error!("Could not send encoded audio frame. Receiver is full");
+                        }
+                        Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                            log::error!(
+                                "Cound not send encoded audio frame. Receiver disconnected"
+                            );
                         }
                     }
                 }
@@ -174,7 +176,7 @@ impl AudioEncoder for OpusEncoder {
         Ok(())
     }
 
-    fn take_encoded_recv(&mut self) -> Option<HeapCons<EncodedAudioFrame>> {
+    fn take_encoded_recv(&mut self) -> Option<Receiver<EncodedAudioFrame>> {
         self.encoded_samples_recv.take()
     }
 }

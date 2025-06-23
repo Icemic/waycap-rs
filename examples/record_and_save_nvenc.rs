@@ -4,7 +4,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ringbuf::traits::Consumer;
 use waycap_rs::{
     pipeline::builder::CaptureBuilder,
     types::{
@@ -35,25 +34,31 @@ fn main() -> Result<()> {
         .with_video_encoder(VideoEncoder::H264Nvenc)
         .build()?;
 
-    let mut video_recv = capture.take_video_receiver();
+    let video_recv = capture.take_video_receiver();
 
     // Use a BTree Map so it is sorted by DTS
     // needed like this for export time monotonic dts times
     let encoded_video = Arc::new(Mutex::new(BTreeMap::<i64, EncodedVideoFrame>::new()));
     let capture_clone = Arc::clone(&encoded_video);
     let h1stop = Arc::clone(&stop);
-    let handle1 = std::thread::spawn(move || loop {
-        if h1stop.load(std::sync::atomic::Ordering::Acquire) {
-            break;
+    let handle1 = std::thread::spawn(move || {
+        while !h1stop.load(std::sync::atomic::Ordering::Acquire) {
+            match video_recv.recv_timeout(Duration::from_millis(100)) {
+                Ok(encoded_frame) => {
+                    capture_clone
+                        .lock()
+                        .unwrap()
+                        .insert(encoded_frame.dts, encoded_frame);
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
+                    continue;
+                }
+                Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+                    log::info!("Video channel disconnected");
+                    break;
+                }
+            }
         }
-
-        while let Some(encoded_frame) = video_recv.try_pop() {
-            capture_clone
-                .lock()
-                .unwrap()
-                .insert(encoded_frame.dts, encoded_frame);
-        }
-        std::thread::sleep(Duration::from_nanos(100));
     });
 
     log::info!("Starting 10-second capture...");

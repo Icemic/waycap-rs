@@ -53,22 +53,23 @@
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
+        mpsc::{self},
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 
 use capture::{audio::AudioCapture, video::VideoCapture, Terminate};
+use crossbeam::{
+    channel::{bounded, Receiver, Sender},
+    select,
+};
 use encoders::{
     audio::AudioEncoder, nvenc_encoder::NvencEncoder, opus_encoder::OpusEncoder,
     vaapi_encoder::VaapiEncoder, video::VideoEncoder,
 };
 use khronos_egl::Image;
 use portal_screencast_waycap::{CursorMode, ScreenCast, SourceType};
-use ringbuf::{
-    traits::{Consumer, Split},
-    HeapCons, HeapRb,
-};
 use types::{
     audio_frame::{EncodedAudioFrame, RawAudioFrame},
     config::{AudioEncoder as AudioEncoderType, QualityPreset, VideoEncoder as VideoEncoderType},
@@ -143,8 +144,7 @@ impl Capture {
         let audio_ready = Arc::new(AtomicBool::new(false));
         let video_ready = Arc::new(AtomicBool::new(false));
 
-        let video_ring_buf = HeapRb::<RawVideoFrame>::new(120);
-        let (video_ring_sender, video_ring_receiver) = video_ring_buf.split();
+        let (frame_tx, frame_rx): (Sender<RawVideoFrame>, Receiver<RawVideoFrame>) = bounded(10);
 
         let (pw_sender, pw_recv) = pipewire::channel::channel();
         let (reso_sender, reso_recv) = mpsc::channel::<(u32, u32)>();
@@ -176,7 +176,7 @@ impl Capture {
                 .run(
                     fd,
                     stream_node,
-                    video_ring_sender,
+                    frame_tx,
                     pw_recv,
                     pause_video,
                     current_time,
@@ -200,7 +200,7 @@ impl Capture {
                 std::process::exit(1);
             }
 
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(100));
         };
 
         join_handles.push(pw_video_capure);
@@ -221,9 +221,8 @@ impl Capture {
 
         let mut audio_encoder: Option<Arc<Mutex<dyn AudioEncoder + Send>>> = None;
         let (pw_audio_sender, pw_audio_recv) = pipewire::channel::channel();
+        let (audio_tx, audio_rx): (Sender<RawAudioFrame>, Receiver<RawAudioFrame>) = bounded(10);
         if include_audio {
-            let audio_ring_buffer = HeapRb::<RawAudioFrame>::new(10);
-            let (audio_ring_sender, audio_ring_receiver) = audio_ring_buffer.split();
             let pause_capture = Arc::clone(&pause);
             let video_r = Arc::clone(&video_ready);
             let audio_r = Arc::clone(&audio_ready);
@@ -231,12 +230,7 @@ impl Capture {
                 log::debug!("Starting audio stream");
                 let audio_cap = AudioCapture::new(video_r, audio_r);
                 audio_cap
-                    .run(
-                        audio_ring_sender,
-                        current_time,
-                        pw_audio_recv,
-                        pause_capture,
-                    )
+                    .run(audio_tx, current_time, pw_audio_recv, pause_capture)
                     .unwrap();
             });
             join_handles.push(pw_audio_worker);
@@ -245,34 +239,32 @@ impl Capture {
                 AudioEncoderType::Opus => Arc::new(Mutex::new(OpusEncoder::new()?)),
             };
 
-            let audio_worker = audio_processor(
-                Arc::clone(&enc),
-                audio_ring_receiver,
-                Arc::clone(&stop),
-                Arc::clone(&pause),
-            );
-            join_handles.push(audio_worker);
-
             audio_encoder = Some(enc);
         } else {
             audio_ready.store(true, Ordering::Release);
         }
 
-        let video_worker = video_processor(
+        // Wait till both threads are ready
+        while !audio_ready.load(Ordering::Acquire) || !video_ready.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let encoding_loop = encoding_loop(
             Arc::clone(&video_encoder),
-            video_ring_receiver,
+            if include_audio {
+                Some(Arc::clone(audio_encoder.as_ref().unwrap()))
+            } else {
+                None
+            },
+            frame_rx,
+            audio_rx,
             Arc::clone(&stop),
             Arc::clone(&pause),
             target_fps,
             Arc::clone(&egl_context),
         );
 
-        join_handles.push(video_worker);
-
-        // Wait till both threads are ready
-        while !audio_ready.load(Ordering::Acquire) || !video_ready.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        join_handles.push(encoding_loop);
 
         log::info!("Capture started sucessfully.");
 
@@ -348,7 +340,7 @@ impl Capture {
     /// **IMPORTANT**
     ///
     /// This gives you ownership of the buffer so this can only be called *once*
-    pub fn take_video_receiver(&mut self) -> HeapCons<EncodedVideoFrame> {
+    pub fn take_video_receiver(&mut self) -> Receiver<EncodedVideoFrame> {
         self.video_encoder
             .lock()
             .unwrap()
@@ -361,7 +353,7 @@ impl Capture {
     /// **IMPORTANT**
     ///
     /// This gives you ownership of the buffer so this can only be called *once*
-    pub fn take_audio_receiver(&mut self) -> Result<HeapCons<EncodedAudioFrame>> {
+    pub fn take_audio_receiver(&mut self) -> Result<Receiver<EncodedAudioFrame>> {
         if let Some(ref mut audio_enc) = self.audio_encoder {
             return Ok(audio_enc.lock().unwrap().take_encoded_recv().unwrap());
         } else {
@@ -424,24 +416,31 @@ impl Drop for Capture {
         // Make OpenGL context current to this thread before we drop nvenc which relies on it
         let _ = self.egl_ctx.release_current();
         let _ = self.egl_ctx.make_current();
+
+        for handle in self.worker_handles.drain(..) {
+            let _ = handle.join();
+        }
     }
 }
 
-fn video_processor(
-    encoder: Arc<Mutex<dyn VideoEncoder + Send>>,
-    mut video_recv: HeapCons<RawVideoFrame>,
+#[allow(clippy::too_many_arguments)]
+fn encoding_loop(
+    video_encoder: Arc<Mutex<dyn VideoEncoder + Send>>,
+    audio_encoder: Option<Arc<Mutex<dyn AudioEncoder + Send>>>,
+    video_recv: Receiver<RawVideoFrame>,
+    audio_recv: Receiver<RawAudioFrame>,
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
     target_fps: u64,
     egl_context: Arc<EglContext>,
 ) -> std::thread::JoinHandle<()> {
     egl_context.release_current().unwrap();
-    std::thread::spawn(move || {
-        let is_nvenc = encoder.lock().unwrap().as_any().is::<NvencEncoder>();
 
+    std::thread::spawn(move || {
+        // CUDA contexts are thread local so set ours to this thread
+        let is_nvenc = video_encoder.lock().unwrap().as_any().is::<NvencEncoder>();
         if is_nvenc {
-            // CUDA contexts are thread local so make it current to this one
-            encoder
+            video_encoder
                 .lock()
                 .unwrap()
                 .as_any()
@@ -450,69 +449,97 @@ fn video_processor(
                 .make_current()
                 .unwrap();
         }
-
         egl_context.make_current().unwrap();
 
         let mut last_timestamp: u64 = 0;
+        let frame_interval = 1_000_000 / target_fps;
 
-        loop {
-            if stop.load(Ordering::Acquire) {
-                break;
-            }
-
+        while !stop.load(Ordering::Acquire) {
             if pause.load(Ordering::Acquire) {
-                std::thread::sleep(Duration::from_nanos(100));
+                std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
 
-            while let Some(raw_frame) = video_recv.try_pop() {
-                let current_time = raw_frame.timestamp as u64;
-
-                if current_time < last_timestamp + (1_000_000 / target_fps) {
-                    continue;
-                }
-
-                if is_nvenc {
-                    match process_dmabuf_frame(&egl_context, &raw_frame) {
-                        Ok(img) => {
-                            encoder.lock().unwrap().process(&raw_frame).unwrap();
-                            egl_context.destroy_image(img).unwrap();
+            // Could not figure out if it is possible to do conditional on branches
+            // Need to not recv from audio since it is dropped when not specified leading to
+            // disconnect errors
+            if audio_encoder.is_some() {
+                select! {
+                    recv(video_recv) -> raw_frame => {
+                        match raw_frame {
+                            Ok(raw_frame) => {
+                                let current_time = raw_frame.timestamp as u64;
+                                if current_time >= last_timestamp + frame_interval {
+                                    if is_nvenc {
+                                        match process_dmabuf_frame(&egl_context, &raw_frame) {
+                                            Ok(img) => {
+                                                video_encoder.lock().unwrap().process(&raw_frame).unwrap();
+                                                egl_context.destroy_image(img).unwrap();
+                                            }
+                                            Err(e) => log::error!("Could not process dma buf frame: {:?}", e),
+                                        }
+                                    } else {
+                                        video_encoder.lock().unwrap().process(&raw_frame).unwrap();
+                                    }
+                                    last_timestamp = current_time;
+                                }
+                            }
+                            Err(_) => {
+                                log::info!("Video channel disconnected");
+                                break;
+                            }
                         }
-                        Err(e) => log::error!("Could not process dma buf frame: {:?}", e),
                     }
-                } else {
-                    encoder.lock().unwrap().process(&raw_frame).unwrap();
+                    recv(audio_recv) -> raw_samples => {
+                        match raw_samples {
+                            Ok(raw_samples) => {
+                                // If we are getting samples then we know this must be set or we
+                                // wouldn't be in here
+                                audio_encoder.as_ref().unwrap().lock().unwrap().process(raw_samples).unwrap();
+                            }
+                            Err(_) => {
+                                log::info!("Audio channel disconnected");
+                                break;
+                            }
+                        }
+                    }
+                    default(Duration::from_millis(100)) => {
+                        // Timeout to check stop/pause flags periodically
+                    }
                 }
-
-                last_timestamp = current_time;
+            } else {
+                select! {
+                    recv(video_recv) -> raw_frame => {
+                        match raw_frame {
+                            Ok(raw_frame) => {
+                                let current_time = raw_frame.timestamp as u64;
+                                if current_time >= last_timestamp + frame_interval {
+                                    if is_nvenc {
+                                        match process_dmabuf_frame(&egl_context, &raw_frame) {
+                                            Ok(img) => {
+                                                video_encoder.lock().unwrap().process(&raw_frame).unwrap();
+                                                egl_context.destroy_image(img).unwrap();
+                                            }
+                                            Err(e) => log::error!("Could not process dma buf frame: {:?}", e),
+                                        }
+                                    } else {
+                                        video_encoder.lock().unwrap().process(&raw_frame).unwrap();
+                                    }
+                                    last_timestamp = current_time;
+                                }
+                            }
+                            Err(_) => {
+                                log::info!("Video channel disconnected");
+                                break;
+                            }
+                        }
+                    }
+                    default(Duration::from_millis(100)) => {
+                        // Timeout to check stop/pause flags periodically
+                    }
+                }
             }
-
-            std::thread::sleep(Duration::from_nanos(100));
         }
-    })
-}
-
-fn audio_processor(
-    encoder: Arc<Mutex<dyn AudioEncoder + Send>>,
-    mut audio_recv: HeapCons<RawAudioFrame>,
-    stop: Arc<AtomicBool>,
-    pause: Arc<AtomicBool>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || loop {
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-
-        if pause.load(Ordering::Acquire) {
-            std::thread::sleep(Duration::from_nanos(100));
-            continue;
-        }
-
-        while let Some(raw_samples) = audio_recv.try_pop() {
-            encoder.lock().unwrap().process(raw_samples).unwrap();
-        }
-
-        std::thread::sleep(Duration::from_nanos(100));
     })
 }
 

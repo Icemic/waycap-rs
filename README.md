@@ -52,14 +52,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Process frames in separate threads
     let video_thread = thread::spawn(move || {
-        while let Some(frame) = video_receiver.try_pop() {
+        while let Ok(frame) = video_receiver.try_recv() {
             // Process video frame (e.g., save to file, stream, etc.)
             println!("Video frame: keyframe={}, size={}", frame.is_keyframe, frame.data.len());
         }
     });
     
     let audio_thread = thread::spawn(move || {
-        while let Some(frame) = audio_receiver.try_pop() {
+        while let Ok(frame) = audio_receiver.try_recv() {
             // Process audio frame
             println!("Audio frame: size={}", frame.data.len());
         }

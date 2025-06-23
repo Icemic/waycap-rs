@@ -5,9 +5,9 @@ use std::ptr::null_mut;
 use crate::types::error::{Result, WaycapError};
 use crate::types::video_frame::RawVideoFrame;
 use crate::types::{config::QualityPreset, video_frame::EncodedVideoFrame};
+use crossbeam::channel::Receiver;
 use ffmpeg_next::{self as ffmpeg};
 use ffmpeg::ffi::{av_hwdevice_ctx_create, av_hwframe_ctx_alloc, AVBufferRef};
-use ringbuf::HeapCons;
 
 pub const GOP_SIZE: u32 = 30;
 
@@ -20,7 +20,7 @@ pub trait VideoEncoder: Send {
     fn reset(&mut self) -> Result<()>;
     fn drop_encoder(&mut self);
     fn get_encoder(&self) -> &Option<ffmpeg::codec::encoder::Video>;
-    fn take_encoded_recv(&mut self) -> Option<HeapCons<EncodedVideoFrame>>;
+    fn take_encoded_recv(&mut self) -> Option<Receiver<EncodedVideoFrame>>;
 
     fn as_any(&self) -> &dyn Any;
 }
