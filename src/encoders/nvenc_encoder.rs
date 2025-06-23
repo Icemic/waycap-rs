@@ -1,5 +1,6 @@
 use std::{any::Any, ptr::null_mut};
 
+use crossbeam::channel::{bounded, Receiver, Sender};
 use cust::{
     prelude::Context,
     sys::{
@@ -17,10 +18,6 @@ use ffmpeg_next::{
         AVPixelFormat,
     },
     Rational,
-};
-use ringbuf::{
-    traits::{Producer, Split},
-    HeapCons, HeapProd, HeapRb,
 };
 
 use crate::types::{
@@ -40,8 +37,8 @@ pub struct NvencEncoder {
     height: u32,
     encoder_name: String,
     quality: QualityPreset,
-    encoded_frame_recv: Option<HeapCons<EncodedVideoFrame>>,
-    encoded_frame_sender: Option<HeapProd<EncodedVideoFrame>>,
+    encoded_frame_recv: Option<Receiver<EncodedVideoFrame>>,
+    encoded_frame_sender: Sender<EncodedVideoFrame>,
 
     cuda_ctx: Context,
     graphics_resource: CUgraphicsResource,
@@ -57,8 +54,9 @@ impl VideoEncoder for NvencEncoder {
         Self: Sized,
     {
         let encoder_name = "h264_nvenc";
-        let video_ring_buffer = HeapRb::<EncodedVideoFrame>::new(120);
-        let (video_ring_sender, video_ring_receiver) = video_ring_buffer.split();
+
+        let (frame_tx, frame_rx): (Sender<EncodedVideoFrame>, Receiver<EncodedVideoFrame>) =
+            bounded(10);
         let cuda_ctx = cust::quick_init().unwrap();
 
         let encoder = Self::create_encoder(width, height, encoder_name, &quality, &cuda_ctx)?;
@@ -69,8 +67,8 @@ impl VideoEncoder for NvencEncoder {
             height,
             encoder_name: encoder_name.to_string(),
             quality,
-            encoded_frame_recv: Some(video_ring_receiver),
-            encoded_frame_sender: Some(video_ring_sender),
+            encoded_frame_recv: Some(frame_rx),
+            encoded_frame_sender: frame_tx,
             cuda_ctx,
             graphics_resource: null_mut(),
             egl_texture: 0,
@@ -178,17 +176,20 @@ impl VideoEncoder for NvencEncoder {
             let mut packet = ffmpeg::codec::packet::Packet::empty();
             if encoder.receive_packet(&mut packet).is_ok() {
                 if let Some(data) = packet.data() {
-                    if let Some(ref mut sender) = self.encoded_frame_sender {
-                        if sender
-                            .try_push(EncodedVideoFrame {
-                                data: data.to_vec(),
-                                is_keyframe: packet.is_key(),
-                                pts: packet.pts().unwrap_or(0),
-                                dts: packet.dts().unwrap_or(0),
-                            })
-                            .is_err()
-                        {
-                            log::error!("Could not send encoded packet to the ringbuf");
+                    match self.encoded_frame_sender.try_send(EncodedVideoFrame {
+                        data: data.to_vec(),
+                        is_keyframe: packet.is_key(),
+                        pts: packet.pts().unwrap_or(0),
+                        dts: packet.dts().unwrap_or(0),
+                    }) {
+                        Ok(_) => {}
+                        Err(crossbeam::channel::TrySendError::Full(_)) => {
+                            log::error!("Could not send encoded video frame. Receiver is full");
+                        }
+                        Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                            log::error!(
+                                "Cound not send encoded video frame. Receiver disconnected"
+                            );
                         }
                     }
                 };
@@ -204,17 +205,20 @@ impl VideoEncoder for NvencEncoder {
             let mut packet = ffmpeg::codec::packet::Packet::empty();
             while encoder.receive_packet(&mut packet).is_ok() {
                 if let Some(data) = packet.data() {
-                    if let Some(ref mut sender) = self.encoded_frame_sender {
-                        if sender
-                            .try_push(EncodedVideoFrame {
-                                data: data.to_vec(),
-                                is_keyframe: packet.is_key(),
-                                pts: packet.pts().unwrap_or(0),
-                                dts: packet.dts().unwrap_or(0),
-                            })
-                            .is_err()
-                        {
-                            log::error!("Could not send encoded packet to the ringbuf");
+                    match self.encoded_frame_sender.try_send(EncodedVideoFrame {
+                        data: data.to_vec(),
+                        is_keyframe: packet.is_key(),
+                        pts: packet.pts().unwrap_or(0),
+                        dts: packet.dts().unwrap_or(0),
+                    }) {
+                        Ok(_) => {}
+                        Err(crossbeam::channel::TrySendError::Full(_)) => {
+                            log::error!("Could not send encoded video frame. Receiver is full");
+                        }
+                        Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
+                            log::error!(
+                                "Cound not send encoded video frame. Receiver disconnected"
+                            );
                         }
                     }
                 };
@@ -246,7 +250,7 @@ impl VideoEncoder for NvencEncoder {
         self.encoder.take();
     }
 
-    fn take_encoded_recv(&mut self) -> Option<HeapCons<EncodedVideoFrame>> {
+    fn take_encoded_recv(&mut self) -> Option<Receiver<EncodedVideoFrame>> {
         self.encoded_frame_recv.take()
     }
 }
