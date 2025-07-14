@@ -61,9 +61,9 @@ impl AudioCapture {
 
         let _audio_core_listener = audio_core
             .add_listener_local()
-            .info(|i| log::info!("AUDIO CORE:\n{i:#?}"))
+            .info(|i| log::debug!("AUDIO CORE:\n{i:#?}"))
             .error(|e, f, g, h| log::error!("{e},{f},{g},{h}"))
-            .done(|d, _| log::info!("DONE: {d}"))
+            .done(|d, _| log::debug!("DONE: {d}"))
             .register();
 
         let data = UserData::default();
@@ -85,7 +85,7 @@ impl AudioCapture {
         let _audio_stream_shared_data_listener = audio_stream
             .add_local_listener_with_user_data(data)
             .state_changed(move |_, _, old, new| {
-                log::debug!("Audio Stream State Changed: {old:?} -> {new:?}");
+                log::info!("Audio Stream State Changed: {old:?} -> {new:?}");
                 audio_ready_clone.store(
                     new == StreamState::Streaming,
                     std::sync::atomic::Ordering::Release,
