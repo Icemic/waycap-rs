@@ -12,11 +12,11 @@ use waycap_rs::{
         error::Result,
         video_frame::EncodedVideoFrame,
     },
-    Capture,
+    Capture, DynamicEncoder,
 };
 
 fn main() -> Result<()> {
-    simple_logging::log_to_stderr(log::LevelFilter::Debug);
+    simple_logging::log_to_stderr(log::LevelFilter::Trace);
     log::info!("Simple Capture and Save Example");
     log::info!("=====================");
     log::info!("This example will capture your screen for 10 seconds");
@@ -116,7 +116,7 @@ fn save_buffer(
     filename: &str,
     video_buffer: &BTreeMap<i64, EncodedVideoFrame>,
     audio_buffer: &Vec<EncodedAudioFrame>,
-    capture: &Capture,
+    capture: &Capture<DynamicEncoder>,
 ) -> Result<()> {
     let mut output = ffmpeg_next::format::output(&filename)?;
 

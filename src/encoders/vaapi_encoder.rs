@@ -1,5 +1,14 @@
-use std::{any::Any, ptr::null_mut};
+use std::ptr::null_mut;
 
+use crate::{
+    encoders::video::{PipewireSPA, ProcessingThread, VideoEncoder},
+    types::{
+        config::QualityPreset,
+        error::{Result, WaycapError},
+        video_frame::{EncodedVideoFrame, RawVideoFrame},
+    },
+    utils::TIME_UNIT_NS,
+};
 use crossbeam::channel::{bounded, Receiver, Sender};
 use drm_fourcc::DrmFourcc;
 use ffmpeg_next::{
@@ -11,18 +20,11 @@ use ffmpeg_next::{
     },
     Rational,
 };
+use pipewire as pw;
 
-use crate::{
-    types::{
-        config::QualityPreset,
-        error::{Result, WaycapError},
-        video_frame::{EncodedVideoFrame, RawVideoFrame},
-    },
-    utils::TIME_UNIT_NS,
-};
+use super::video::{create_hw_device, create_hw_frame_ctx, GOP_SIZE};
 
-use super::video::{create_hw_device, create_hw_frame_ctx, VideoEncoder, GOP_SIZE};
-
+/// Encoder which encodes frames using Vaapi
 pub struct VaapiEncoder {
     encoder: Option<ffmpeg::codec::encoder::Video>,
     width: u32,
@@ -34,35 +36,8 @@ pub struct VaapiEncoder {
     filter_graph: Option<ffmpeg::filter::Graph>,
 }
 
-impl VideoEncoder for VaapiEncoder {
-    fn new(width: u32, height: u32, quality: QualityPreset) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        let encoder_name = "h264_vaapi";
-        let encoder = Self::create_encoder(width, height, encoder_name, &quality)?;
-
-        let (frame_tx, frame_rx): (Sender<EncodedVideoFrame>, Receiver<EncodedVideoFrame>) =
-            bounded(10);
-        let filter_graph = Some(Self::create_filter_graph(&encoder, width, height)?);
-
-        Ok(Self {
-            encoder: Some(encoder),
-            width,
-            height,
-            encoder_name: encoder_name.to_string(),
-            quality,
-            encoded_frame_recv: Some(frame_rx),
-            encoded_frame_sender: frame_tx,
-            filter_graph,
-        })
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn process(&mut self, frame: &RawVideoFrame) -> Result<()> {
+impl ProcessingThread for VaapiEncoder {
+    fn process(&mut self, frame: RawVideoFrame) -> Result<()> {
         if let Some(ref mut encoder) = self.encoder {
             if let Some(fd) = frame.dmabuf_fd {
                 let mut drm_frame = ffmpeg::util::frame::Video::new(
@@ -141,7 +116,7 @@ impl VideoEncoder for VaapiEncoder {
                         }
                         Err(crossbeam::channel::TrySendError::Disconnected(_)) => {
                             log::error!(
-                                "Cound not send encoded video frame. Receiver disconnected"
+                                "Could not send encoded video frame. Receiver disconnected"
                             );
                         }
                     }
@@ -149,6 +124,30 @@ impl VideoEncoder for VaapiEncoder {
             }
         }
         Ok(())
+    }
+}
+
+impl VideoEncoder for VaapiEncoder {
+    type Output = EncodedVideoFrame;
+    fn reset(&mut self) -> Result<()> {
+        self.drop_processor();
+        let new_encoder =
+            Self::create_encoder(self.width, self.height, &self.encoder_name, &self.quality)?;
+
+        let new_filter_graph = Self::create_filter_graph(&new_encoder, self.width, self.height)?;
+
+        self.encoder = Some(new_encoder);
+        self.filter_graph = Some(new_filter_graph);
+        Ok(())
+    }
+
+    fn drop_processor(&mut self) {
+        self.encoder.take();
+        self.filter_graph.take();
+    }
+
+    fn output(&mut self) -> Option<Receiver<EncodedVideoFrame>> {
+        self.encoded_frame_recv.clone()
     }
 
     /// Drain the filter graph and encoder of any remaining frames it is processing
@@ -176,34 +175,92 @@ impl VideoEncoder for VaapiEncoder {
         }
         Ok(())
     }
-
-    fn reset(&mut self) -> Result<()> {
-        self.drop_encoder();
-        let new_encoder =
-            Self::create_encoder(self.width, self.height, &self.encoder_name, &self.quality)?;
-
-        let new_filter_graph = Self::create_filter_graph(&new_encoder, self.width, self.height)?;
-
-        self.encoder = Some(new_encoder);
-        self.filter_graph = Some(new_filter_graph);
-        Ok(())
-    }
-
     fn get_encoder(&self) -> &Option<ffmpeg::codec::encoder::Video> {
         &self.encoder
     }
+}
 
-    fn drop_encoder(&mut self) {
-        self.encoder.take();
-        self.filter_graph.take();
-    }
-
-    fn get_encoded_recv(&mut self) -> Option<Receiver<EncodedVideoFrame>> {
-        self.encoded_frame_recv.clone()
+impl PipewireSPA for VaapiEncoder {
+    fn get_spa_definition() -> Result<pw::spa::pod::Object> {
+        Ok(pw::spa::pod::object!(
+            pw::spa::utils::SpaTypes::ObjectParamFormat,
+            pw::spa::param::ParamType::EnumFormat,
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::MediaType,
+                Id,
+                pw::spa::param::format::MediaType::Video
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::MediaSubtype,
+                Id,
+                pw::spa::param::format::MediaSubtype::Raw
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoModifier,
+                Long,
+                0
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoFormat,
+                Choice,
+                Enum,
+                Id,
+                pw::spa::param::video::VideoFormat::NV12,
+                pw::spa::param::video::VideoFormat::I420,
+                pw::spa::param::video::VideoFormat::BGRA,
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoSize,
+                Choice,
+                Range,
+                Rectangle,
+                pw::spa::utils::Rectangle {
+                    width: 2560,
+                    height: 1440
+                }, // Default
+                pw::spa::utils::Rectangle {
+                    width: 1,
+                    height: 1
+                }, // Min
+                pw::spa::utils::Rectangle {
+                    width: 4096,
+                    height: 4096
+                } // Max
+            ),
+            pw::spa::pod::property!(
+                pw::spa::param::format::FormatProperties::VideoFramerate,
+                Choice,
+                Range,
+                Fraction,
+                pw::spa::utils::Fraction { num: 240, denom: 1 }, // Default
+                pw::spa::utils::Fraction { num: 0, denom: 1 },   // Min
+                pw::spa::utils::Fraction { num: 244, denom: 1 }  // Max
+            ),
+        ))
     }
 }
 
 impl VaapiEncoder {
+    pub(crate) fn new(width: u32, height: u32, quality: QualityPreset) -> Result<Self> {
+        let encoder_name = "h264_vaapi";
+        let encoder = Self::create_encoder(width, height, encoder_name, &quality)?;
+
+        let (frame_tx, frame_rx): (Sender<EncodedVideoFrame>, Receiver<EncodedVideoFrame>) =
+            bounded(10);
+        let filter_graph = Some(Self::create_filter_graph(&encoder, width, height)?);
+
+        Ok(Self {
+            encoder: Some(encoder),
+            width,
+            height,
+            encoder_name: encoder_name.to_string(),
+            quality,
+            encoded_frame_recv: Some(frame_rx),
+            encoded_frame_sender: frame_tx,
+            filter_graph,
+        })
+    }
+
     fn create_encoder(
         width: u32,
         height: u32,
@@ -268,7 +325,7 @@ impl VaapiEncoder {
         Ok(encoder)
     }
 
-    fn get_encoder_params(quality: &QualityPreset) -> ffmpeg::Dictionary<'_>{
+    fn get_encoder_params(quality: &QualityPreset) -> ffmpeg::Dictionary<'_> {
         let mut opts = ffmpeg::Dictionary::new();
         opts.set("vsync", "vfr");
         opts.set("rc", "VBR");
@@ -336,6 +393,6 @@ impl Drop for VaapiEncoder {
         if let Err(e) = self.drain() {
             log::error!("Error while draining vaapi encoder during drop: {e:?}");
         }
-        self.drop_encoder();
+        self.drop_processor();
     }
 }

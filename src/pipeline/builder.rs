@@ -1,4 +1,5 @@
 use crate::{
+    encoders::dynamic_encoder::DynamicEncoder,
     types::{
         config::{AudioEncoder, QualityPreset, VideoEncoder},
         error::Result,
@@ -69,7 +70,7 @@ impl CaptureBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Capture> {
+    pub fn build(self) -> Result<Capture<DynamicEncoder>> {
         let quality = match self.quality_preset {
             Some(qual) => qual,
             None => QualityPreset::Medium,
