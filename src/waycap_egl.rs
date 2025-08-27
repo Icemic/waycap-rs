@@ -50,7 +50,7 @@ pub struct EglContext {
     egl_instance: Instance<Dynamic<libloading::Library, egl::EGL1_5>>,
     display: egl::Display,
     context: egl::Context,
-    surface: egl::Surface,
+    surface: Option<egl::Surface>, // Optional for surfaceless context
     _config: egl::Config,
     dmabuf_supported: bool,
     dmabuf_modifiers_supported: bool,
@@ -80,49 +80,99 @@ impl EglContext {
         egl_instance.initialize(display)?;
 
         let attributes = [
-            egl::BUFFER_SIZE,
-            24,
+            egl::SURFACE_TYPE,
+            egl::PBUFFER_BIT,
             egl::RENDERABLE_TYPE,
             egl::OPENGL_ES_BIT,
-            egl::NONE,
             egl::NONE,
         ];
 
         let config = egl_instance
             .choose_first_config(display, &attributes)?
-            .expect("unable to find an appropriate ELG configuration");
+            .or_else(|| {
+                log::warn!("pbuffer config not found, trying window config");
+                let fallback_attributes = [
+                    egl::SURFACE_TYPE,
+                    egl::WINDOW_BIT,
+                    egl::RENDERABLE_TYPE,
+                    egl::OPENGL_ES_BIT,
+                    egl::NONE,
+                ];
+                egl_instance
+                    .choose_first_config(display, &fallback_attributes)
+                    .ok()
+                    .flatten()
+            })
+            .expect("unable to find an appropriate EGL configuration");
 
         let context_attributes = [egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE];
 
         let context = egl_instance.create_context(display, config, None, &context_attributes)?;
 
-        let surface_attributes = [egl::WIDTH, width, egl::HEIGHT, height, egl::NONE];
+        let extensions = egl_instance.query_string(Some(display), egl::EXTENSIONS)?;
+        let ext_str = extensions.to_string_lossy();
 
-        let surface = egl_instance.create_pbuffer_surface(display, config, &surface_attributes)?;
-        egl_instance.make_current(display, Some(surface), Some(surface), Some(context))?;
+        // Check supported surface types for this config
+        let surface_type = egl_instance.get_config_attrib(display, config, egl::SURFACE_TYPE)?;
+        let supports_pbuffer = (surface_type & egl::PBUFFER_BIT) != 0;
 
-        gl::load_with(|symbol| egl_instance.get_proc_address(symbol).unwrap() as *const _);
+        if supports_pbuffer {
+            log::debug!("Using pbuffer surface");
+            let surface_attributes = [egl::WIDTH, width, egl::HEIGHT, height, egl::NONE];
+            let surface =
+                egl_instance.create_pbuffer_surface(display, config, &surface_attributes)?;
+            egl_instance.make_current(display, Some(surface), Some(surface), Some(context))?;
 
-        let (dmabuf_supported, dmabuf_modifiers_supported) =
-            Self::check_dmabuf_support(&egl_instance, display).unwrap();
+            gl::load_with(|symbol| egl_instance.get_proc_address(symbol).unwrap() as *const _);
+
+            let (dmabuf_supported, dmabuf_modifiers_supported) =
+                Self::check_dmabuf_support(&egl_instance, display).unwrap();
 
             let gpu_vendor = get_gpu_vendor();
 
-        Ok(Self {
-            egl_instance,
-            display,
-            _config: config,
-            context,
-            surface,
-            dmabuf_supported,
-            dmabuf_modifiers_supported,
-            persistent_texture_id: Cell::new(None),
-            gpu_vendor,
-            width,
-            height,
+            Ok(Self {
+                egl_instance,
+                display,
+                _config: config,
+                context,
+                surface: Some(surface),
+                dmabuf_supported,
+                dmabuf_modifiers_supported,
+                persistent_texture_id: Cell::new(None),
+                gpu_vendor,
+                width,
+                height,
 
-            _wayland_display: wayland_display,
-        })
+                _wayland_display: wayland_display,
+            })
+        } else if ext_str.contains("EGL_KHR_surfaceless_context") {
+            log::debug!("Using surfaceless context");
+            egl_instance.make_current(display, None, None, Some(context))?;
+
+            gl::load_with(|symbol| egl_instance.get_proc_address(symbol).unwrap() as *const _);
+
+            let (dmabuf_supported, dmabuf_modifiers_supported) =
+                Self::check_dmabuf_support(&egl_instance, display).unwrap_or((false, false));
+
+            let gpu_vendor = get_gpu_vendor();
+
+            Ok(Self {
+                egl_instance,
+                display,
+                _config: config,
+                context,
+                surface: None,
+                dmabuf_supported,
+                dmabuf_modifiers_supported,
+                persistent_texture_id: Cell::new(None),
+                gpu_vendor,
+                width,
+                height,
+                _wayland_display: wayland_display,
+            })
+        } else {
+            Err("No suitable surface type available".into())
+        }
     }
 
     pub fn update_texture_from_image(&self, egl_image: egl::Image) -> Result<()> {
@@ -412,8 +462,8 @@ impl EglContext {
     pub fn make_current(&self) -> Result<()> {
         self.egl_instance.make_current(
             self.display,
-            Some(self.surface),
-            Some(self.surface),
+            self.surface,
+            self.surface,
             Some(self.context),
         )?;
         Ok(())
@@ -439,9 +489,11 @@ impl Drop for EglContext {
         let _ = self
             .egl_instance
             .make_current(self.display, None, None, None);
-        let _ = self
-            .egl_instance
-            .destroy_surface(self.display, self.surface);
+
+        if let Some(surface) = self.surface {
+            let _ = self.egl_instance.destroy_surface(self.display, surface);
+        }
+
         let _ = self
             .egl_instance
             .destroy_context(self.display, self.context);
