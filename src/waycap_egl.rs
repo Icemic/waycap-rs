@@ -106,7 +106,7 @@ impl EglContext {
         let (dmabuf_supported, dmabuf_modifiers_supported) =
             Self::check_dmabuf_support(&egl_instance, display).unwrap();
 
-        let gpu_vendor = GpuVendor::from(egl_instance.query_string(Some(display), egl::VENDOR)?);
+            let gpu_vendor = get_gpu_vendor();
 
         Ok(Self {
             egl_instance,
@@ -448,6 +448,18 @@ impl Drop for EglContext {
         let _ = self.egl_instance.terminate(self.display);
         if let Some(texture) = self.persistent_texture_id.get() {
             self.delete_texture(texture);
+        }
+    }
+}
+
+fn get_gpu_vendor() -> GpuVendor {
+    unsafe {
+        let vendor_ptr = gl::GetString(gl::VENDOR);
+        if vendor_ptr.is_null() {
+            GpuVendor::UNKNOWN
+        } else {
+            let vendor = CStr::from_ptr(vendor_ptr as *const std::ffi::c_char);
+            GpuVendor::from(vendor)
         }
     }
 }
