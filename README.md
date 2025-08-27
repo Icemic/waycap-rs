@@ -31,7 +31,8 @@ crossbeam = "0.8.4"
 
 ## Example Usage
 ```rust
-use waycap_rs::{CaptureBuilder, QualityPreset, VideoEncoder, AudioEncoder};
+use waycap_rs::pipeline::builder::CaptureBuilder;
+use waycap_rs::types::config::{AudioEncoder, QualityPreset, VideoEncoder};
 use std::{thread, time::Duration};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -40,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_audio()
         .with_quality_preset(QualityPreset::Medium)
         .with_cursor_shown()
-        .with_video_encoder(VideoEncoder::Vaapi)
+        .with_video_encoder(VideoEncoder::H264Vaapi)
         .with_audio_encoder(AudioEncoder::Opus)
         .build()?;
     
@@ -53,14 +54,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Process frames in separate threads
     let video_thread = thread::spawn(move || {
-        while let Ok(frame) = video_receiver.try_recv() {
+        while let Ok(frame) = video_receiver.recv() {
             // Process video frame (e.g., save to file, stream, etc.)
             println!("Video frame: keyframe={}, size={}", frame.is_keyframe, frame.data.len());
         }
     });
     
     let audio_thread = thread::spawn(move || {
-        while let Ok(frame) = audio_receiver.try_recv() {
+        while let Ok(frame) = audio_receiver.recv() {
             // Process audio frame
             println!("Audio frame: size={}", frame.data.len());
         }
