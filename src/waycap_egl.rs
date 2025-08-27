@@ -116,63 +116,43 @@ impl EglContext {
         let surface_type = egl_instance.get_config_attrib(display, config, egl::SURFACE_TYPE)?;
         let supports_pbuffer = (surface_type & egl::PBUFFER_BIT) != 0;
 
-        if supports_pbuffer {
+        let surface = if supports_pbuffer {
             log::debug!("Using pbuffer surface");
             let surface_attributes = [egl::WIDTH, width, egl::HEIGHT, height, egl::NONE];
             let surface =
                 egl_instance.create_pbuffer_surface(display, config, &surface_attributes)?;
             egl_instance.make_current(display, Some(surface), Some(surface), Some(context))?;
-
-            gl::load_with(|symbol| egl_instance.get_proc_address(symbol).unwrap() as *const _);
-
-            let (dmabuf_supported, dmabuf_modifiers_supported) =
-                Self::check_dmabuf_support(&egl_instance, display).unwrap();
-
-            let gpu_vendor = get_gpu_vendor();
-
-            Ok(Self {
-                egl_instance,
-                display,
-                _config: config,
-                context,
-                surface: Some(surface),
-                dmabuf_supported,
-                dmabuf_modifiers_supported,
-                persistent_texture_id: Cell::new(None),
-                gpu_vendor,
-                width,
-                height,
-
-                _wayland_display: wayland_display,
-            })
+            Some(surface)
         } else if ext_str.contains("EGL_KHR_surfaceless_context") {
             log::debug!("Using surfaceless context");
             egl_instance.make_current(display, None, None, Some(context))?;
-
-            gl::load_with(|symbol| egl_instance.get_proc_address(symbol).unwrap() as *const _);
-
-            let (dmabuf_supported, dmabuf_modifiers_supported) =
-                Self::check_dmabuf_support(&egl_instance, display).unwrap_or((false, false));
-
-            let gpu_vendor = get_gpu_vendor();
-
-            Ok(Self {
-                egl_instance,
-                display,
-                _config: config,
-                context,
-                surface: None,
-                dmabuf_supported,
-                dmabuf_modifiers_supported,
-                persistent_texture_id: Cell::new(None),
-                gpu_vendor,
-                width,
-                height,
-                _wayland_display: wayland_display,
-            })
+            None
         } else {
-            Err("No suitable surface type available".into())
-        }
+            return Err("No suitable surface type available".into());
+        };
+
+        gl::load_with(|symbol| egl_instance.get_proc_address(symbol).unwrap() as *const _);
+
+        let (dmabuf_supported, dmabuf_modifiers_supported) =
+            Self::check_dmabuf_support(&egl_instance, display).unwrap();
+
+        let gpu_vendor = get_gpu_vendor();
+
+        Ok(Self {
+            egl_instance,
+            display,
+            _config: config,
+            context,
+            surface,
+            dmabuf_supported,
+            dmabuf_modifiers_supported,
+            persistent_texture_id: Cell::new(None),
+            gpu_vendor,
+            width,
+            height,
+
+            _wayland_display: wayland_display,
+        })
     }
 
     pub fn update_texture_from_image(&self, egl_image: egl::Image) -> Result<()> {
